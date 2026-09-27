@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""
+Link-Tree-Crawler (Hybrid Analysis & Ollama AI Edition)
+-------------------------------------------------------
+Crawls websites, parses sitemaps, respects robots.txt, performs brute-force path discovery,
+runs classic keyword analysis, and executes local AI evaluations via Ollama.
+"""
+
+import os
+import sys
+import time
+import json
+import csv
+import argparse
+import re
+from collections import deque
+from urllib.parse import urljoin, urlparse
+from urllib.robotparser import RobotFileParser
+import xml.etree.ElementTree as ET
+
+import requests
+from bs4 import BeautifulSoup
+
+# --- DEFAULTS ---
+DEFAULT_KEYWORDS = ["admin", "login", "password", "api", "dashboard", "secret", "config", "contact", "db", "backup", "v1", "v2", "env"]
+DEFAULT_BF_PATHS = ["admin", "login", "dashboard", "api", "config", "test", "dev", "staging", "backup", ".env", "phpmyadmin", "console", "server-status"]
+DEFAULT_PROMPT_TEMPLATE = """You are a cybersecurity and web architecture analyzer.
+Analyze the following web page data and determine its structural or security relevance.
+
+URL: {url}
+Title: {title}
+H1: {h1}
+Keywords Found: {keywords}
+Content Preview: {content}
+
+Provide a concise response in the following format:
+RATING: [Score 1-10] | SUMMARY: [1-2 sentence description of what this page represents and why it is interesting]"""
+
+def print_status(message: str) -> None:
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[{timestamp}] [STATUS] {message}")
+
+def get_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Crawls a website and generates an interactive HTML report.")
+
+    parser.add_argument("url", nargs="?", help="Start URL (e.g., https://example.com)")
+    parser.add_argument("-mp", "--max-pages", type=int, default=200, help="Max pages to crawl")
+    parser.add_argument("-md", "--max-depth", type=int, default=5, help="Max crawl depth")
+    parser.add_argument("-to", "--timeout", type=float, default=8.0, help="Timeout per request in seconds")
+    parser.add_argument("-mt", "--max-time", type=float, default=60.0, help="Max execution time in seconds")
+    parser.add_argument("-ae", "--allow-external", action="store_true", help="Allow crawling external domains")
+    parser.add_argument("-rr", "--respect-robots", action="store_true", help="Respect robots.txt rules")
+    parser.add_argument("-an", "--analyse", choices=["none", "classic", "hybrid"], default="none", help="Analysis mode")
+    parser.add_argument("-mo", "--model", type=str, default="", help="Ollama AI model name")
+    parser.add_argument("-kw", "--keywords", type=str, default="", help="Path to CSV file with keywords")
+    parser.add_argument("-pr", "--prompt", type=str, default="", help="Path to TXT file with custom AI prompt")
+    parser.add_argument("-bf", "--brute-force", nargs="?", const="DEFAULT", default="", help="Enable brute-force mode")
+    parser.add_argument("-hp", "--html-path", type=str, default="", help="Path for HTML report (Req. for classic/hybrid)")
+
+    args = parser.parse_args()
+    args.analyse = args.analyse.lower()
+
+    if not args.url:
+        args.url = input("No URL provided. Enter target URL (e.g., https://example.com): ").strip()
+
+    if not urlparse(args.url).scheme:
+        args.url = "https://" + args.url
+
+    html_path_val = getattr(args, 'html_path', None)
+    if not html_path_val:
+        html_path_val = getattr(args, 'html-path', None)
+
+    if args.analyse in ["classic", "hybrid"] and not html_path_val:
+        print_status("ERROR: Flag '-hp / --html-path' is required when analysis mode is 'classic' or 'hybrid'.")
+        sys.exit(1)
+
+    args.html_path_final = html_path_val
+
+    if args.analyse == "hybrid" and not args.model:
+        print_status("ERROR: Flag '-mo / --model' is required when analysis mode is 'hybrid'.")
+        sys.exit(1)
+
+    return args
+
+def load_keywords(csv_path: str) -> list:
+    if not csv_path: return DEFAULT_KEYWORDS
+    if not os.path.exists(csv_path):
+        print_status(f"WARNING: Keyword file '{csv_path}' not found. Using defaults.")
+        return DEFAULT_KEYWORDS
+
+    keywords = []
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                for item in row:
+                    cleaned = item.strip().lower()
+                    if cleaned: keywords.append(cleaned)
+        print_status(f"Loaded {len(keywords)} keywords.")
+        return keywords
+    except Exception as e:
+        print_status(f"ERROR reading CSV: {e}. Using defaults.")
+        return DEFAULT_KEYWORDS
+
+def load_prompt(txt_path: str) -> str:
+    if not txt_path: return DEFAULT_PROMPT_TEMPLATE
+    if not os.path.exists(txt_path): return DEFAULT_PROMPT_TEMPLATE
+    try:
+        with open(txt_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except:
+        return DEFAULT_PROMPT_TEMPLATE
+
+def load_bf_wordlist(bf_arg: str) -> list:
+    if not bf_arg or bf_arg == "DEFAULT": return DEFAULT_BF_PATHS
+    if not os.path.exists(bf_arg): return DEFAULT_BF_PATHS
+
+    paths = []
+    try:
+        with open(bf_arg, "r", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                for item in row:
+                    cleaned = item.strip().lstrip("/")
+                    if cleaned: paths.append(cleaned)
+        print_status(f"Loaded {len(paths)} brute-force paths.")
+        return paths
+    except:
+        return DEFAULT_BF_PATHS
+
+def normalize_url(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+def fetch_sitemap(start_url: str, session: requests.Session, timeout: float) -> list:
+    parsed = urlparse(start_url)
+    sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
+    urls = []
+    try:
+        resp = session.get(sitemap_url, timeout=timeout)
+        if resp.status_code == 200 and "xml" in resp.headers.get("Content-Type", ""):
+            root = ET.fromstring(resp.content)
+            namespaces = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+            for loc in root.findall(".//ns:loc", namespaces) or root.findall(".//loc"):
+                if loc.text: urls.append(normalize_url(loc.text.strip()))
+            print_status(f"Extracted {len(urls)} URLs from sitemap.xml")
+    except Exception as e:
+        print_status(f"Sitemap check skipped/failed: {e}")
+    return urls
+
+def init_robots_parser(start_url: str, timeout: float) -> RobotFileParser:
+    parsed = urlparse(start_url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    rp = RobotFileParser()
+    rp.set_url(robots_url)
+    try:
+        rp.read()
+        print_status("Parsed robots.txt")
+    except:
+        print_status("Could not read robots.txt")
+    return rp
+
+def analyze_classic_page(soup: BeautifulSoup, keywords: list, raw_html: str) -> dict:
+    title = soup.title.string.strip() if soup.title and soup.title.string else "No Title"
+    h1_tag = soup.find("h1")
+    h1 = h1_tag.text.strip() if h1_tag else "No H1"
+
+    text_content = soup.get_text(separator=" ", strip=True).lower()
+
+    matched_keywords = {}
+    for kw in keywords:
+        # Regex: Matches word only if NOT surrounded by letters or numbers
+        # Eliminates false positives like "capital" for "api" or base64 garbage
+        pattern = re.compile(r'(?i)(?<![a-zA-Z0-9])' + re.escape(kw) + r'(?![a-zA-Z0-9])')
+
+        if pattern.search(title):
+            matched_keywords[kw] = f"Title matched: {title}"
+            continue
+
+        match = pattern.search(raw_html)
+        if match:
+            idx = match.start()
+            start = max(0, idx - 40)
+            end = min(len(raw_html), match.end() + 40)
+            snippet = raw_html[start:end].replace('\n', ' ').replace('\r', ' ').strip()
+            matched_keywords[kw] = f"... {snippet} ..."
+
+    return {
+        "title": title,
+        "h1": h1,
+        "keywords": matched_keywords,
+        "is_interesting": len(matched_keywords) > 0,
+        "snippet": text_content[:500],
+        "ai_rating": None,
+        "ai_summary": "Pending/Not analyzed"
+    }
+
+def run_ollama_analysis(data: dict, model: str, prompt_template: str) -> None:
+    print_status("AI Phase started: Processing accumulated interesting pages via Ollama...")
+    ollama_url = "http://localhost:11434/api/generate"
+
+    interesting_items = [(url, info) for url, info in data.items() if info.get("is_interesting")]
+    total_interesting = len(interesting_items)
+
+    for idx, (url, info) in enumerate(interesting_items, start=1):
+        print_status(f"[{idx}/{total_interesting}] Querying Ollama ({model}) for: {url}")
+
+        kw_str = ", ".join(info.get("keywords", {}).keys())
+        formatted_prompt = prompt_template.format(
+            url=url, title=info.get("title", ""), h1=info.get("h1", ""),
+            keywords=kw_str, content=info.get("snippet", "")
+        )
+
+        try:
+            res = requests.post(ollama_url, json={"model": model, "prompt": formatted_prompt, "stream": False}, timeout=60.0)
+            if res.status_code == 200:
+                resp_text = res.json().get("response", "").strip()
+                if "RATING:" in resp_text and "|" in resp_text:
+                    parts = resp_text.split("|", 1)
+                    info["ai_rating"] = parts[0].replace("RATING:", "").strip()
+                    info["ai_summary"] = parts[1].replace("SUMMARY:", "").strip()
+                else:
+                    info["ai_summary"] = resp_text
+                print_status(f"  └─ AI Result: Score={info['ai_rating']} | Summary={info['ai_summary'][:50]}...")
+            else:
+                info["ai_summary"] = f"Error (HTTP {res.status_code})"
+        except Exception as e:
+            info["ai_summary"] = f"Connection Error: {e}"
+
+def build_terminal_tree(urls: set) -> dict:
+    tree = {}
+    for url in urls:
+        parsed = urlparse(url)
+        parts = [p for p in (parsed.netloc + parsed.path).split("/") if p]
+        node = tree
+        for part in parts:
+            node = node.setdefault(part, {})
+        node.setdefault("__leaf__", True)
+    return tree
+
+def print_terminal_tree(node: dict, prefix: str = "") -> None:
+    keys = sorted(k for k in node.keys() if k != "__leaf__")
+    for i, key in enumerate(keys):
+        is_last = (i == len(keys) - 1)
+        print(prefix + ("└── " if is_last else "├── ") + key)
+        print_terminal_tree(node[key], prefix + ("    " if is_last else "│   "))
+
+def generate_output_files(html_path: str, data: dict, start_url: str) -> None:
+    base_dir = os.path.dirname(os.path.abspath(html_path)) or "."
+    data_js_path = os.path.join(base_dir, "data.js")
+
+    with open(data_js_path, "w", encoding="utf-8") as f:
+        f.write(f"window.CRAWL_DATA = {json.dumps(data, indent=2)};")
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crawl Report - {urlparse(start_url).netloc}</title>
+    <script src="data.js"></script>
+    <style>
+        :root {{ --bg: #0f172a; --card: #1e293b; --text: #f8fafc; --accent: #8b5cf6; --danger: #ef4444; --success: #10b981; --border: #334155; }}
+        body {{ font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; }}
+        h1 {{ text-align: center; color: var(--accent); margin-bottom: 8px; }}
+        .subtitle {{ text-align: center; color: #94a3b8; margin-bottom: 24px; }}
+        .stats {{ display: flex; justify-content: center; gap: 20px; margin-bottom: 24px; }}
+        .stat-box {{ background: var(--card); border: 2px solid var(--border); padding: 16px 24px; border-radius: 12px; text-align: center; transition: all 0.2s; }}
+        #interestingBox {{ cursor: pointer; user-select: none; }}
+        #interestingBox:hover {{ border-color: var(--danger); background: #2a1f2d; }}
+        .stat-val {{ font-size: 1.5rem; font-weight: bold; color: var(--accent); }}
+        .controls {{ display: flex; justify-content: center; gap: 12px; margin-bottom: 24px; }}
+        input[type="text"] {{ padding: 12px 20px; width: 400px; background: var(--card); border: 1px solid var(--border); color: #fff; border-radius: 8px; outline: none; }}
+        input[type="text"]:focus {{ border-color: var(--accent); }}
+        .btn {{ background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 12px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: 0.2s; }}
+        .btn:hover {{ border-color: var(--accent); background: #2d3748; }}
+
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 20px; }}
+        .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; position: relative; word-break: break-word; }}
+        .card.interesting {{ border-top: 4px solid var(--danger); }}
+        .card a {{ color: #38bdf8; text-decoration: none; font-weight: 600; word-break: break-all; }}
+
+        .tag {{ display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; margin: 4px 4px 0 0; text-transform: uppercase; position: relative; }}
+        .tag-kw {{ background: rgba(239, 68, 68, 0.2); color: var(--danger); border: 1px solid var(--danger); cursor: help; }}
+        .tag-ai {{ background: rgba(16, 185, 129, 0.2); color: var(--success); border: 1px solid var(--success); margin-bottom: 8px;}}
+        .meta {{ font-size: 13px; color: #94a3b8; margin-top: 12px; line-height: 1.5; }}
+
+        .tooltip .tooltiptext {{ visibility: hidden; width: max-content; max-width: 320px; background-color: #000; color: #fff; text-transform: none; text-align: left; border-radius: 6px; padding: 8px; position: absolute; z-index: 10; bottom: 130%; left: 50%; transform: translateX(-50%); opacity: 0; transition: opacity 0.2s; font-family: monospace; font-size: 11px; white-space: pre-wrap; border: 1px solid var(--accent); }}
+        .tooltip:hover .tooltiptext {{ visibility: visible; opacity: 1; }}
+
+        #treeContainer {{ display: none; background: var(--card); padding: 24px; border-radius: 12px; border: 1px solid var(--border); overflow-x: auto; font-family: monospace; line-height: 1.8; }}
+        .tree-node {{ margin-left: 24px; border-left: 1px dashed var(--border); padding-left: 12px; }}
+        .tree-item a {{ color: #e2e8f0; text-decoration: none; }}
+        .tree-item a:hover {{ text-decoration: underline; color: #38bdf8; }}
+        .tree-item.interesting > a {{ color: var(--danger); font-weight: bold; }}
+    </style>
+</head>
+<body>
+    <h1>🕸️ Link-Tree-Crawler Report</h1>
+    <div class="subtitle">Target: {start_url}</div>
+
+    <div class="stats">
+        <div class="stat-box"><div class="stat-val" id="totalPages">0</div>Total Pages</div>
+        <div class="stat-box" id="interestingBox" onclick="toggleInterestingFilter()">
+            <div class="stat-val" id="interestingPages">0</div>Interesting (Click to filter)
+        </div>
+    </div>
+
+    <div class="controls">
+        <input type="text" id="searchInput" onkeyup="filterView()" placeholder="Search paths, titles, keywords...">
+        <button class="btn" onclick="toggleViewMode()">Toggle Site-Tree</button>
+    </div>
+
+    <div class="grid" id="cardGrid"></div>
+    <div id="treeContainer"></div>
+
+    <script>
+        let showOnlyInteresting = false;
+        let isTreeView = false;
+
+        // Security Function: Escapes HTML tags to prevent broken UI (e.g. from extracted <input> tags)
+        function escapeHTML(str) {{
+            return String(str || '').replace(/[&<>'"]/g, tag => ({{
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+            }}[tag]));
+        }}
+
+        document.addEventListener("DOMContentLoaded", () => {{
+            const data = window.CRAWL_DATA || {{}};
+            const grid = document.getElementById("cardGrid");
+            let interestingCount = 0;
+
+            Object.entries(data).forEach(([url, info]) => {{
+                if (info.is_interesting) interestingCount++;
+
+                const card = document.createElement("div");
+                card.className = "card" + (info.is_interesting ? " interesting" : "");
+
+                let kwTags = Object.entries(info.keywords || {{}}).map(([kw, context]) => {{
+                    return `<span class="tag tag-kw tooltip">${{escapeHTML(kw)}}<span class="tooltiptext">${{escapeHTML(context)}}</span></span>`;
+                }}).join("");
+
+                let aiBox = info.ai_summary ? `<div class="meta"><span class="tag tag-ai">AI Score: ${{escapeHTML(info.ai_rating || 'N/A')}}</span><br><strong style="color:#cbd5e1">AI Summary:</strong> ${{escapeHTML(info.ai_summary)}}</div>` : "";
+
+                card.innerHTML = `
+                    <a href="${{escapeHTML(url)}}" target="_blank">${{escapeHTML(url)}}</a>
+                    ${{info.title ? `<div class="meta"><b>Title:</b> ${{escapeHTML(info.title)}}<br><b>H1:</b> ${{escapeHTML(info.h1 || 'N/A')}}</div>` : ''}}
+                    <div style="margin-top:12px; margin-bottom:8px;">${{kwTags}}</div>
+                    ${{aiBox}}
+                `;
+                grid.appendChild(card);
+            }});
+
+            document.getElementById("totalPages").innerText = Object.keys(data).length;
+            document.getElementById("interestingPages").innerText = interestingCount;
+        }});
+
+        function toggleInterestingFilter() {{
+            showOnlyInteresting = !showOnlyInteresting;
+            document.getElementById('interestingBox').style.borderColor = showOnlyInteresting ? 'var(--danger)' : 'var(--border)';
+            filterView();
+        }}
+
+        function toggleViewMode() {{
+            isTreeView = !isTreeView;
+            document.getElementById('cardGrid').style.display = isTreeView ? 'none' : 'grid';
+            document.getElementById('treeContainer').style.display = isTreeView ? 'block' : 'none';
+            if (isTreeView && document.getElementById('treeContainer').innerHTML === "") {{
+                buildHtmlTree();
+            }}
+        }}
+
+        function filterView() {{
+            let input = document.getElementById('searchInput').value.toLowerCase();
+
+            let cards = document.getElementsByClassName('card');
+            for (let card of cards) {{
+                let text = card.innerText.toLowerCase();
+                let isInt = card.classList.contains('interesting');
+                card.style.display = (text.includes(input) && (!showOnlyInteresting || isInt)) ? "" : "none";
+            }}
+
+            if (isTreeView) buildHtmlTree();
+        }}
+
+        function buildHtmlTree() {{
+            const data = window.CRAWL_DATA || {{}};
+            let input = document.getElementById('searchInput').value.toLowerCase();
+            const tree = {{}};
+
+            Object.keys(data).forEach(url => {{
+                let info = data[url];
+                if (showOnlyInteresting && !info.is_interesting) return;
+                if (input && !url.toLowerCase().includes(input) && !(info.title||'').toLowerCase().includes(input)) return;
+
+                try {{
+                    const urlObj = new URL(url);
+                    const parts = (urlObj.hostname + urlObj.pathname).split('/').filter(Boolean);
+                    let current = tree;
+                    parts.forEach(part => {{
+                        if (!current[part]) current[part] = {{}};
+                        current = current[part];
+                    }});
+                    current['__url__'] = url;
+                    current['__interesting__'] = info.is_interesting;
+                }} catch(e) {{}}
+            }});
+
+            function renderTree(node) {{
+                let html = '<div class="tree-node">';
+                const keys = Object.keys(node).filter(k => k !== '__url__' && k !== '__interesting__').sort();
+                keys.forEach(k => {{
+                    let isLeaf = !!node[k]['__url__'];
+                    let isInt = node[k]['__interesting__'];
+                    let classStr = isInt ? 'tree-item interesting' : 'tree-item';
+
+                    html += `<div class="${{classStr}}">`;
+                    if (isLeaf) {{
+                        html += `📄 <a href="${{escapeHTML(node[k]['__url__'])}}" target="_blank">${{escapeHTML(k)}}</a>`;
+                    }} else {{
+                        html += `📁 <b>${{escapeHTML(k)}}</b>`;
+                    }}
+                    html += renderTree(node[k]);
+                    html += `</div>`;
+                }});
+                html += '</div>';
+                return html === '<div class="tree-node"></div>' ? '' : html;
+            }}
+
+            document.getElementById('treeContainer').innerHTML = renderTree(tree) || "<i>No results match the current filter.</i>";
+        }}
+    </script>
+</body>
+</html>"""
+
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    print_status("Dashboard generated successfully.")
+
+def main():
+    args = get_arguments()
+    start_url = args.url
+    start_domain = urlparse(start_url).netloc
+
+    keywords = load_keywords(args.keywords)
+    prompt_template = load_prompt(args.prompt)
+    bf_wordlist = load_bf_wordlist(args.brute_force)
+
+    print_status(f"Starting Crawl on: {start_url}")
+    session = requests.Session()
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; LTCrawler/2.2)"}
+
+    robots_parser = init_robots_parser(start_url, args.timeout) if args.respect_robots else None
+
+    visited_data = {}
+    queue = deque([(normalize_url(start_url), 0)])
+
+    for surl in fetch_sitemap(start_url, session, args.timeout):
+        if args.allow_external or urlparse(surl).netloc == start_domain:
+            queue.append((surl, 1))
+
+    start_time = time.time()
+
+    print_status("Phase 1: Starting BFS Crawling...")
+    while queue and len(visited_data) < args.max_pages:
+        if time.time() - start_time > args.max_time:
+            print_status("Max time reached.")
+            break
+
+        url, depth = queue.popleft()
+
+        if url in visited_data or depth > args.max_depth:
+            continue
+
+        if robots_parser and not robots_parser.can_fetch(headers["User-Agent"], url):
+            continue
+
+        try:
+            resp = session.get(url, headers=headers, timeout=args.timeout)
+            if resp.status_code != 200 or "text/html" not in resp.headers.get("Content-Type", ""):
+                continue
+        except requests.RequestException:
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        if args.analyse in ["classic", "hybrid"]:
+            page_info = analyze_classic_page(soup, keywords, resp.text)
+        else:
+            page_info = {"is_interesting": False}
+
+        visited_data[url] = page_info
+        print_status(f"[{len(visited_data)}/{args.max_pages}] Crawled: {url}")
+
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"].strip()
+            if href.startswith(("mailto:", "tel:", "javascript:")): continue
+            abs_url = normalize_url(urljoin(url, href))
+
+            if not args.allow_external and urlparse(abs_url).netloc != start_domain: continue
+            if abs_url not in visited_data: queue.append((abs_url, depth + 1))
+
+    if args.brute_force and len(visited_data) < args.max_pages:
+        print_status("Phase 1.5: Brute-Force discovery...")
+        for path in bf_wordlist:
+            if len(visited_data) >= args.max_pages or (time.time() - start_time > args.max_time): break
+            bf_url = normalize_url(f"https://{start_domain}/{path}")
+            if bf_url in visited_data: continue
+
+            print_status(f"Brute-Forcing: {bf_url}")
+            try:
+                resp = session.get(bf_url, headers=headers, timeout=args.timeout)
+                if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
+                    print_status(f"  └─ Found: {bf_url}")
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    visited_data[bf_url] = analyze_classic_page(soup, keywords, resp.text) if args.analyse in ["classic", "hybrid"] else {"is_interesting": False}
+                    for tag in soup.find_all("a", href=True):
+                        href = tag["href"].strip()
+                        if not href.startswith(("mailto:", "tel:", "javascript:")):
+                            abs_url = normalize_url(urljoin(bf_url, href))
+                            if args.allow_external or urlparse(abs_url).netloc == start_domain:
+                                if abs_url not in visited_data: queue.append((abs_url, 1))
+            except requests.RequestException: continue
+
+    if args.analyse == "hybrid":
+        run_ollama_analysis(visited_data, args.model, prompt_template)
+
+    if args.analyse == "none" and not args.html_path_final:
+        tree = build_terminal_tree(set(visited_data.keys()))
+        print_terminal_tree(tree)
+    else:
+        generate_output_files(args.html_path_final, visited_data, start_url)
+
+    print_status("Done.")
+
+if __name__ == "__main__":
+    main()

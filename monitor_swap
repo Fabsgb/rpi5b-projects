@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+# KONFIGURATION
+THRESHOLD=50                  # Schwellenwert in Prozent
+LOG_FILE="/home/server/swap.log" # Pfad zur Logdatei
+SLEEP_TIME=10                 # Intervall in Sekunden
+
+# Endlosschleife für die Überwachung
+while true; do
+    # Direktes Auslesen der Swap-Werte aus /proc/meminfo ohne externe Tools
+    while read -r key value unit; do
+        case "$key" in
+            SwapTotal:) swap_total=$value ;;
+            SwapFree:)  swap_free=$value ;;
+        esac
+    done < /proc/meminfo
+
+    # Berechnung nur ausführen, wenn Swap konfiguriert ist
+    if [[ -n "$swap_total" && "$swap_total" -gt 0 ]]; then
+        # Genutzten Swap berechnen
+        swap_used=$((swap_total - swap_free))
+        
+        # Prozentualen Anteil berechnen (Ganzzahl-Arithmetik für maximale Effizienz)
+        swap_pct=$(( (swap_used * 100) / swap_total ))
+
+        # Schwellenwert-Filterung
+        if [ "$swap_pct" -gt "$THRESHOLD" ]; then
+            # Zeitstempel generieren und effizient in Datei schreiben
+            timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            echo "[$timestamp] WARNING: Swap usage is at ${swap_pct}% (Total: ${swap_total}kB, Free: ${swap_free}kB)" >> "$LOG_FILE"
+        fi
+    fi
+
+    # Pausieren bis zum nächsten Check
+    sleep "$SLEEP_TIME"
+done

@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# Zeitzone setzen (anpassen falls nötig)
+TIMEZONE="Europe/Berlin"
+
+# Root-Check
+if [[ $EUID -ne 0 ]]; then
+    echo "Dieses Script muss als root ausgeführt werden."
+    exit 1
+fi
+
+echo "=== Zeitsynchronisation ==="
+
+# systemd-timesyncd oder ntpdate verwenden
+if command -v timedatectl &> /dev/null; then
+    echo "Setze Zeitzone auf $TIMEZONE..."
+    timedatectl set-timezone "$TIMEZONE"
+
+    echo "Aktiviere NTP-Synchronisation..."
+    timedatectl set-ntp true
+
+    # Warte kurz damit die Sync starten kann
+    sleep 3
+
+    echo ""
+    echo "Aktueller Status:"
+    timedatectl status
+else
+    echo "timedatectl nicht gefunden, versuche ntpdate..."
+
+    if ! command -v ntpdate &> /dev/null; then
+        apt-get install -y ntpdate
+    fi
+
+    ntpdate pool.ntp.org
+fi
+
+echo ""
+echo "Aktuelle Systemzeit: $(date)"

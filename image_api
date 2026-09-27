@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+import base64
+import subprocess
+
+from fastapi import FastAPI, HTTPException, Query, Response
+
+app = FastAPI()
+
+# Make sure this points to your actual script
+SCRIPT_PATH = "/home/server/scripts/perchance_image_generator"
+
+MIN_AMOUNT = 1
+MAX_AMOUNT = 60
+
+
+@app.get("/generate")
+def generate(
+    prompt: str,
+    negative_prompt: str = "",
+    shape: str = "portrait",
+    style: str = "Painted Anime",
+    amount: int = Query(1, ge=MIN_AMOUNT, le=MAX_AMOUNT),
+    timeout: float = Query(
+        ...,
+        gt=0,
+        description=(
+            "Seconds to allow the generation subprocess to run. The caller "
+            "(the Open WebUI tool) works this out from `amount`; this server "
+            "no longer has a fixed timeout of its own."
+        ),
+    ),
+):
+    # --base-64 tells the script to print each generated image as base64 on
+    # its own line on stdout instead of writing it to a file, so nothing
+    # touches disk here.
+    cmd = [
+        SCRIPT_PATH,
+        "--prompt", prompt,
+        "--base-64",
+        "--amount", str(amount),
+    ]
+    if negative_prompt:
+        cmd.extend(["--negative-prompt", negative_prompt])
+    if shape:
+        cmd.extend(["--shape", shape])
+    if style:
+        cmd.extend(["--style", style])
+
+    try:
+        process = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="Image generation timed out.")
+
+    if process.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"Generation failed: {process.stderr}")
+
+    # One base64 payload per line, one line per image that was successfully
+    # generated and parsed by the script. This list can be shorter than
+    # `amount` if some images in the batch failed (see stderr for details).
+    b64_lines = [line.strip() for line in process.stdout.splitlines() if line.strip()]
+    if not b64_lines:
+        raise HTTPException(status_code=500, detail=f"No image data returned. stderr: {process.stderr}")
+
+    try:
+        # Decoded purely to validate; the original strings are what get
+        # returned, since they're already valid base64.
+        for line in b64_lines:
+            base64.b64decode(line, validate=True)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Could not decode base64 output from generation script.")
+
+    # A single image keeps the original raw-bytes response shape, so nothing
+    # that expects a plain JPEG (e.g. a browser hitting this URL directly)
+    # breaks. Multiple images are returned as a JSON array of base64
+    # strings instead, since one HTTP response can only carry one
+    # media_type/body.
+    if len(b64_lines) == 1:
+        return Response(content=base64.b64decode(b64_lines[0]), media_type="image/jpeg")
+
+    return {"images": b64_lines}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    # Listens on port 8000
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,0 +1,86 @@
+#!/bin/sh
+
+# 1. Absender abfragen
+read -p "Bitte gib die Absender E-Mail-Adresse ein: " SENDER
+
+# 2. Empfänger abfragen
+read -p "Bitte gib die Empfänger E-Mail-Adresse ein: " RECIPIENT
+
+# 3. Betreff abfragen
+read -p "Bitte gib den Betreff ein: " SUBJECT
+
+# 4. Text abfragen
+echo "Bitte gib den Text der E-Mail ein (Drücke STRG+D in einer leeren Zeile, um die Eingabe zu beenden):"
+BODY=$(cat)
+
+# Bildschirm aufräumen
+clear
+
+# 5. Daten zur Kontrolle anzeigen
+echo "========================================="
+echo "          E-MAIL ZUSAMMENFASSUNG         "
+echo "========================================="
+echo "Von:      $SENDER"
+echo "An:       $RECIPIENT"
+echo "Betreff:  $SUBJECT"
+echo "-----------------------------------------"
+echo "Text:"
+echo "$BODY"
+echo "========================================="
+echo ""
+
+# 6. Sende-Bestätigung abfragen
+read -p "Möchtest du diese E-Mail jetzt direkt senden? (j/n): " CONFIRM
+
+if [ "$CONFIRM" = "j" ] || [ "$CONFIRM" = "J" ]; then
+    echo "Starte direkte Zustellung über die normale Internetverbindung..."
+    
+    # E-Mail formatieren und in den Docker-Container leiten
+    (
+        echo "From: $SENDER"
+        echo "To: $RECIPIENT"
+        echo "Subject: $SUBJECT"
+        echo ""
+        echo "$BODY"
+    ) | docker run --rm -i \
+        -e SENDER="$SENDER" \
+        -e RECIPIENT="$RECIPIENT" \
+        alpine:latest sh -c '
+            # Benötigte Pakete für DNS-Abfrage und E-Mail-Versand installieren
+            apk add --no-cache bind-tools curl >/dev/null 2>&1
+            
+            # Domain des Empfängers extrahieren (alles nach dem @)
+            DOMAIN="${RECIPIENT#*@}"
+            echo "Suche zuständigen Mailserver (MX-Record) für $DOMAIN..."
+            
+            # MX-Record mit der höchsten Priorität auslesen
+            MX=$(dig +short MX "$DOMAIN" | sort -n | awk "{print \$2}" | sed "s/\.$//" | head -n 1)
+            
+            # Fallback auf A-Record, falls kein MX-Record existiert
+            if [ -z "$MX" ]; then
+                MX=$(dig +short A "$DOMAIN" | head -n 1)
+            fi
+            
+            if [ -z "$MX" ]; then
+                echo "Fehler: Kein Mailserver für $DOMAIN gefunden."
+                exit 1
+            fi
+            
+            echo "Verbinde mit Empfänger-Server: $MX auf Port 25..."
+            
+            # E-Mail per curl von stdin (-) direkt an den Server senden
+            curl -s -v --url "smtp://$MX:25" \
+                 --mail-from "$SENDER" \
+                 --mail-rcpt "$RECIPIENT" \
+                 --upload-file -
+        '
+
+    # Prüfen, ob der Befehl erfolgreich war
+    if [ $? -eq 0 ]; then
+        echo "Erfolg: Die E-Mail wurde direkt an den Server des Empfängers übergeben!"
+    else
+        echo "Fehler: Die Zustellung ist fehlgeschlagen."
+    fi
+else
+    echo "Abbruch: Die E-Mail wurde NICHT gesendet."
+fi

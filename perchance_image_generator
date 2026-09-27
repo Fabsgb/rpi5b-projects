@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Script to automate image generation using the Perchance website.
+This script uses Camoufox to avoid bot detection (Grrrr)
+(I am deffinitely allowed to do this™)
+"""
+from __future__ import annotations
+
+from argparse import ArgumentParser, ArgumentTypeError
+from ast import literal_eval
+from base64 import b64decode, b64encode
+from datetime import datetime as dt
+from functools import partial
+from getpass import getuser
+from os import makedirs, path, system
+from platform import system as platform_system
+import re
+from secrets import token_urlsafe
+from subprocess import run as subprocess_run, CalledProcessError, TimeoutExpired
+from sys import exit as bye
+from time import sleep, time
+from urllib import request
+
+from camoufox.sync_api import Camoufox
+from colorama import init
+from playwright.sync_api import Browser, BrowserContext, TimeoutError as PlaywrightTimeoutError
+from sympy import Symbol, sympify
+from fabs_lib import get_content_frame, human_typing, log, log_event, match_choice, output
+
+
+def unix_sec() -> str:
+    return dt.now().astimezone().strftime('%s')
+
+
+def match_number(wanted_number: str) -> str:
+    global numbers
+    for number in numbers:
+        if number == wanted_number:
+            return number
+    raise ArgumentTypeError("Number not in " + str(numbers))
+
+
+def get_choice(wanted_choice: str, options: list[str]) -> str:
+    """Try to match the option with an allowed one, if the match fails, the standart will be used."""
+    try:
+        return match_choice(wanted_choice, options)
+    except ValueError:
+        return options[0]
+
+
+def upscale_image(image: bytes) -> bytes:
+    """Send an image to /home/server/scripts/bigger_pics for upscaling.
+
+    Blocks until the external script finishes, then returns the upscaled
+    image bytes decoded from the script's Base64 output.
+
+    Raises CalledProcessError if the script exits non-zero, or
+    TimeoutExpired if it does not finish within the allotted time.
+    """
+    result = subprocess_run(
+        ["/home/server/scripts/bigger_pics", "-b64", b64encode(image).decode("ascii")],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=True,
+    )
+    return b64decode(result.stdout.strip(), validate=True)
+
+
+def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str, shape: str, style: str, amount: int, timeout: float) -> tuple[bool, list[bytes]]:
+    """Generate images in Perchance and return their raw bytes.
+
+    `timeout` is the maximum total time, in seconds, to wait for ALL
+    generated images to appear in the DOM before giving up.
+
+    The browser interaction stays in this function; callers decide whether to
+    upscale, save, or emit the returned images.
+    """
+    amount_int = int(amount)
+    amount_str = str(amount)
+    browser = camoufox
+    images: list[bytes] = []
+
+    try:
+        page = browser.new_page()
+
+        page.goto("http://api.ipify.org")
+        ip_addr = page.locator('pre').inner_text()
+        log_event(f"VPN IP Address: {ip_addr}", level="INFO")
+        if ip_addr == request.urlopen('http://api.ipify.org').read().decode('utf-8'):
+            log_event(f"IP Address '{ip_addr}' is the ip address of your host, something might be wrong with the proxy configuration, please check!", level="ERROR")
+            if input("Should the generation be continued (y/N)? ").casefold() == "n":
+                browser.close()
+                return False, images
+            else:
+                log_event("Continuing generation...", level="INFO")
+        #-----Switching sites-----#
+        page.goto("https://perchance.org/lemheealw3")
+        log_event("Loading site...", level="INFO")
+
+        #-----Finding the image generator-----#
+        frame = get_content_frame(page.locator("#outputIframeEl"))
+
+        #-----Closing existing dialogs-----#
+        for dialog in frame.locator("dialog[open]").all():
+            try:
+                dialog.locator("button, .close, [aria-label='Close']").first.click(timeout=10000, force=True)
+                log_event("Closed a dialog via button click.", level="INFO")
+            except PlaywrightTimeoutError:
+                log_event("Button click failed for a dialog, trying JS fallback.", level="WARNING")
+                page.screenshot(path=f"{tmp_path}/dialog_error_screenshot_{unix_sec()}.png")
+                # Fallback: force-close popupAnnoucement directly via its JS close() function
+                try:
+                    frame.locator("#popupAnnoucement").evaluate("el => el.close()")
+                    log_event("Called popupAnnoucement.close() via element handle.", level="INFO")
+                except Exception as e:
+                    log_event(f"JS fallback failed: {e}", level="ERROR")
+
+        #-----Filling in generation options-----#
+        try:
+            frame.locator('textarea[data-name="description"]').click(force=True)
+            human_typing(locator=frame.locator('textarea[data-name="description"]'), text=prompt)
+            log_event("Filled in positive prompt.", level="INFO")
+        except Exception as e:
+            page.screenshot(path=f"{tmp_path}/error_screenshot_{unix_sec()}.png")
+            with open(f"{tmp_path}/error_log_{unix_sec()}.txt", "a") as f:
+                f.write(str(e))
+            raise e
+
+        if negative_prompt:
+            frame.locator('textarea[data-name="negative"]').click()
+            human_typing(locator=frame.locator('textarea[data-name="negative"]'), text=negative_prompt)
+            log_event("Filled in negative prompt.", level="INFO")
+        else:
+            log_event("No negative prompt provided; skipping.", level="INFO")
+
+        if shape != "portrait":
+            try:
+                frame.locator('select[data-name="shape"]').click()
+                frame.locator('select[data-name="shape"]').select_option(shape)
+                log_event(f"Selected shape: {shape}", level="INFO")
+            except PlaywrightTimeoutError as e:
+                log_event(f"Error while selecting shape: {e}", level="ERROR")
+                log_event("Using default shape.", level="ERROR")
+
+        if style != styles[0]:
+            try:
+                frame.locator('select[data-name="artStyle"]').click()
+                frame.locator('select[data-name="artStyle"]').select_option(style)
+                log_event(f"Selected style: {style}", level="INFO")
+            except PlaywrightTimeoutError as e:
+                log_event(f"Error while selecting style: {e}", level="ERROR")
+                log_event("Using default style.", level="ERROR")
+
+        if amount_str != "1":
+            try:
+                frame.locator('select[data-name="numImages"]').click()
+                frame.locator('select[data-name="numImages"]').select_option(amount_str)
+                log_event(f"Selected amount: {amount_int}", level="INFO")
+            except PlaywrightTimeoutError as e:
+                log_event(f"Error while selecting amount: {e}", level="ERROR")
+                log_event("Using default amount.", level="ERROR")
+
+        #-----Starting generation-----#
+        frame.locator("#generateButtonEl").click()
+        log_event("Starting generation and waiting for the image element(s) in DOM...", level="INFO")
+
+        try:
+            end_time = time() + timeout
+            content_guard_bypassed = False
+
+            #-----Collecting generated images-----#
+            for i in range(amount_int):
+                try:
+                    remaining_time = end_time - time()
+                    if remaining_time <= 0:
+                        log_event("Global timeout reached. Stopping wait for remaining images.", level="ERROR")
+                        break
+
+                    image_iframe_locator = frame.locator("iframe.text-to-image-plugin-image-iframe").nth(i)
+                    iframe_ctx = get_content_frame(image_iframe_locator)
+
+                    generated_image_locator = iframe_ctx.locator("img").first
+                    guard_locator = iframe_ctx.locator("#contentGuardEl").first
+
+                    log_event(f"Waiting for image {i+1}/{amount_int} to become visible in DOM...", level="INFO")
+
+                    img_ready = False
+                    image_src = ""
+
+                    # Poll until the image is ready or the batch deadline is reached.
+                    while time() < end_time:
+                        if not content_guard_bypassed and guard_locator.is_visible():
+                            log_event(f"Content guard detected on image {i+1}! Attempting bypass...", level="INFO")
+                            try:
+                                interaction_timeout = 15000
+
+                                gear_btn = iframe_ctx.locator("#contentGuardMessageEl button").first
+                                gear_btn.click(timeout=interaction_timeout)
+
+                                select_el = iframe_ctx.locator("#contentGuardSettingsSelectEl").first
+                                select_el.select_option("315360000000", timeout=interaction_timeout)
+
+                                checkbox = iframe_ctx.locator("#contentGuardOver18CheckboxEl").first
+                                checkbox.check(timeout=interaction_timeout)
+
+                                save_btn = iframe_ctx.locator("#contentGuardSettingsEl button").first
+                                save_btn.click(timeout=interaction_timeout)
+
+                                log_event("Content guard UI bypass successful.", level="INFO")
+                                content_guard_bypassed = True
+                            except Exception as e:
+                                log_event(f"UI bypass failed ({e}), trying JS fallback...", level="WARNING")
+                                try:
+                                    iframe_ctx.evaluate('''() => {
+                                        const select = document.getElementById("contentGuardSettingsSelectEl");
+                                        const checkbox = document.getElementById("contentGuardOver18CheckboxEl");
+                                        const msg = document.getElementById("contentGuardMessageEl");
+                                        const settings = document.getElementById("contentGuardSettingsEl");
+
+                                        if (select) select.value = "315360000000";
+                                        if (checkbox) checkbox.checked = true;
+
+                                        localStorage.okayToShowNsfwUntil = Date.now() + 315360000000;
+                                        if (msg) msg.style.display = '';
+                                        if (settings) settings.style.display = 'none';
+                                        if (typeof updateContentGuardVisibility === 'function') updateContentGuardVisibility(true);
+                                    }''')
+                                    log_event("Content guard JS fallback successful.", level="INFO")
+                                    content_guard_bypassed = True
+                                except Exception as js_e:
+                                    log_event(f"JS fallback failed: {js_e}", level="ERROR")
+
+                        if generated_image_locator.is_visible():
+                            current_src = generated_image_locator.get_attribute("src")
+                            if current_src and current_src.startswith("data:image"):
+                                image_src = current_src
+                                img_ready = True
+                                break
+
+                        sleep(0.5)
+
+                    if not img_ready:
+                        log_event(f"Timeout waiting for image {i+1} to be generated or guard blocked it.", level="ERROR")
+                        continue
+
+                    #-----Processing image data-----#
+                    log_event(f"Processing image {i+1} data from src attribute...", level="INFO")
+                    match = re.search(r'base64,([A-Za-z0-9+/=]+)', image_src)
+
+                    if match:
+                        image_bytes = b64decode(match.group(1), validate=True)
+                        images.append(image_bytes)
+                        log_event(f"Image {i+1} data collected successfully.", level="SUCCESS")
+                    else:
+                        log_event(f"Image {i+1} 'src' attribute contains data:image, but is not valid base64.", level="ERROR")
+
+                except Exception as e:
+                    log_event(f"Error or timeout while processing image {i+1} in DOM: {e}", level="ERROR")
+
+        except Exception as e:
+            log_event(f"Error during extraction loop: {e}", level="ERROR")
+
+    finally:
+        browser.close()
+        system(f"chmod -R 700 {tmp_path}")
+
+    return bool(images), images
+
+
+def run() -> None:
+    global numbers, shapes, styles, tmp_path
+
+    try:
+        if platform_system().casefold() == "linux":
+            tmp_path = "/tmp/perchance_" + getuser()
+        elif platform_system().casefold() == "windows":
+            tmp_path = path.join(path.expandvars("%TEMP%"), "perchance_" + getuser())
+        else:
+            log_event(f"Unsupported platform: {platform_system()}", level="ERROR")
+            bye(1)
+
+        with open(f"{tmp_path}/styles.txt", "r") as f:
+            styles = literal_eval(f.read())
+
+        with open(f"{tmp_path}/shapes.txt", "r") as f:
+            shapes = literal_eval(f.read())
+
+        with open(f"{tmp_path}/numbers.txt", "r") as f:
+            numbers = literal_eval(f.read())
+
+        parser = ArgumentParser(description="Automate image generation.")
+        parser.add_argument("-p", "--prompt", type=str, required=True, help="The main prompt used to generate the image.")
+        parser.add_argument("-np", "--negative-prompt", type=str, default="", help="Things which should not be inside the image.")
+        parser.add_argument("-s", "--shape", type=partial(get_choice, options=shapes), default=shapes[0], help="The shape of the image to generate.")
+        parser.add_argument("-st", "--style", type=partial(get_choice, options=styles), default=styles[0], help="The style of the image to generate.")
+        parser.add_argument("-n", "--amount", type=match_number, default=numbers[0], help="The amount of images to generate, maximum=60.")
+        parser.add_argument("-t", "--timeout", type=str, default="60 + n * 60", help="Maximum total time, in seconds, to wait for all generated images to appear before giving up. Can be a plain number, or an expression in terms of `n` -- the total number of images requested via --amount -- such as '60 + n * 60' to scale the global wait with the batch size.")
+        parser.add_argument("--gui", action="store_false", help="Run the script with a visible browser window (for debugging, do not use for production).")
+        parser.add_argument("-l", "--list", action="store_true", help="List all available styles, shapes, and amounts, then exit.")
+        parser.add_argument("-u", "--upscale", action="store_true", help="Send the immage to bigger.pics and upscale it so that it longest side is 2048px.")
+
+        output_type = parser.add_mutually_exclusive_group()
+        output_type.add_argument("-o", "--output-dir", type=str, help="Where the final image should be saved, if not specified the name of the image file will be image.jpg. The standard path is within /tmp so the image will not be saved accros reboots.")
+        output_type.add_argument("-b64", "--base-64", action="store_true", dest="base_64", help="Pass the final image as Base64 instead of saving it to a path.")
+        args = parser.parse_args()
+
+        if args.list:
+            log_event(f"Available styles: {styles}", level="INFO")
+            log_event(f"Available shapes: {shapes}", level="INFO")
+            log_event(f"Available amounts: {numbers}", level="INFO")
+            bye(0)
+
+        try:
+            timeout_seconds = float(sympify(args.timeout).subs(Symbol("n"), args.amount))
+        except Exception as e:
+            log_event(f"Invalid --timeout expression '{args.timeout}': {e}", level="ERROR")
+            bye(1)
+
+        if timeout_seconds <= 0:
+            log_event(f"Computed --timeout ({timeout_seconds}s) must be a positive number.", level="ERROR")
+            bye(1)
+
+        log_event(f"Timeout = {timeout_seconds} s", level="INFO")
+
+        base_output_dir = ""
+        if not args.base_64:
+            if not args.output_dir:
+                output_dir = path.join(tmp_path, "images", f"{unix_sec()}_{token_urlsafe(8)}")
+                while path.exists(output_dir):
+                    output_dir = path.join(tmp_path, "images", f"{unix_sec()}_{token_urlsafe(8)}")
+            else:
+                output_dir = args.output_dir
+            if not output_dir.endswith(".jpg"):
+                output_dir = path.join(output_dir, "image.jpg")
+            makedirs(path.dirname(output_dir), exist_ok=True)
+            system(f"chmod 2700 {tmp_path}")
+        else:
+            output_dir = "None"
+
+
+        if not args.base_64:
+            base_output_dir = output_dir[:-4] if output_dir.endswith(".jpg") else output_dir
+
+        log_event("Starting Browser...", level="INFO")
+        with Camoufox(humanize=True, headless=args.gui, proxy={"server": "http://localhost:666"}) as camoufox:
+            success, images = browse(camoufox, args.prompt, args.negative_prompt, args.shape, args.style, args.amount, timeout_seconds)
+
+        if success:
+            for index, image_bytes in enumerate(images, start=1):
+                if args.upscale:
+                    log_event(f"Upscaling image {index} via bigger_pics...", level="INFO")
+                    try:
+                        image_bytes = upscale_image(image_bytes)
+                        log_event(f"Image {index} upscaled successfully.", level="SUCCESS")
+                    except TimeoutExpired:
+                        log_event(f"Upscaling image {index} timed out; using original resolution.", level="ERROR")
+                    except CalledProcessError as e:
+                        log_event(f"Upscaling image {index} failed (exit code {e.returncode}): {e.stderr.strip() if e.stderr else 'no stderr'}; using original resolution.", level="ERROR")
+                    except Exception as e:
+                        log_event(f"Unexpected error while upscaling image {index}: {e}; using original resolution.", level="ERROR")
+
+                if args.base_64:
+                    log_event(f"Returning image {index} as Base64 string.", level="SUCCESS")
+                    output(b64encode(image_bytes).decode("ascii"), flush=True)
+                else:
+                    current_output_path = f"{base_output_dir}_{index}.jpg" if int(args.amount) > 1 else f"{base_output_dir}.jpg"
+                    with open(current_output_path, "wb") as f:
+                        f.write(image_bytes)
+
+                    log_event(f"Image {index} saved successfully in", level="SUCCESS", flush=True, end=" ")
+                    output(current_output_path, flush=True, end="")
+                    log(" !", flush=True)
+
+            if not args.base_64:
+                log_event("Writing info file...", level="INFO")
+                split_output_dir = base_output_dir.rsplit("image", 1)
+                with open("info.txt".join(split_output_dir), "w") as f:
+                    f.write(f"Prompt: {args.prompt}\n")
+                    f.write(f"Negative Prompt: {args.negative_prompt}\n")
+                    f.write(f"Shape: {args.shape}\n")
+                    f.write(f"Style: {args.style}\n")
+                    f.write(f"Amount: {args.amount}\n")
+                    f.write(f"Upscaled: {args.upscale}")
+            log_event("Finished image generation process; Exiting script.", level="SUCCESS")
+            bye(0)
+        else:
+            log_event("Image generation failed; Exiting script.", level="ERROR")
+            bye(1)
+
+
+
+    except KeyboardInterrupt:
+        log_event("Script interrupted by user; Exiting.", level="ERROR")
+        bye(1)
+
+
+if __name__ == "__main__":
+    init()
+    log_event("Initializing script...", level="INFO")
+    run()

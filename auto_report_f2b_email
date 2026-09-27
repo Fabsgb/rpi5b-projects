@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+import argparse
+from requests import get, RequestException
+from smtplib import SMTP
+from email.message import EmailMessage
+from os import getenv
+from dotenv import load_dotenv
+
+load_dotenv()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("ip_addr", help="Set the ip address of the bad actor which should be reportet.")
+parser.add_argument("log", help="The log snipsets which prove the malicues actions of the ip")
+args = parser.parse_args()
+
+
+print(f"Looking up abuse email for IP: {args.ip_addr}...\n")
+
+url = f"https://rdap.org/ip/{args.ip_addr}"
+abuse_email = None
+
+try:
+    response = get(url, timeout=10)
+    response.raise_for_status()
+    rdap_data = response.json()
+
+    entities_to_check = rdap_data.get("entities", [])
+
+    while entities_to_check:
+        current_entity = entities_to_check.pop(0)
+
+        if "abuse" in current_entity.get("roles", []):
+            vcard_array = current_entity.get("vcardArray", [])
+
+            if vcard_array and len(vcard_array) >= 2:
+                properties = vcard_array[1]
+
+                for prop in properties:
+                    if prop[0] == "email":
+                        abuse_email = prop[3]
+                        break
+
+        if abuse_email:
+            break
+
+        if "entities" in current_entity:
+            entities_to_check.extend(current_entity["entities"])
+
+except RequestException as e:
+    print(f"HTTP Request failed: {e}")
+
+if abuse_email:
+    print(f"Found Abuse Email: {abuse_email}")
+else:
+    print("No abuse email could be found.")
+
+email_template = f"""The IP address {args.ip_addr} has conducted malicious actions, and this email address ({abuse_email}) is listed as the corresponding abuse contact on rdap.org.
+
+This report has also been filed at https://www.abuseipdb.com/check/{args.ip_addr}
+
+Here are the log details that prove this IP address conducted malicious actions:
+
+---
+{args.log}
+---
+
+*This is an automated report. If you believe this is a mistake or need additional information, please contact fabs0612lol@gmail.com*
+
+Best regards,
+fail2ban system on fabs-gb.de
+"""
+
+message = EmailMessage()
+message.set_content(email_template)
+message["Subject"] = "IP Address report"
+message["From"] = "noreply@fabs-gb.de"
+message["To"] = "fabs0612lol@gmail.com"
+
+s = SMTP("smtp-relay.brevo.com", 587)
+s.starttls()
+s.login("b709c2001@smtp-brevo.com", getenv("SMTP_PASSWORD"))
+s.send_message(message)

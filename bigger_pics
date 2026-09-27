@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+""""Upscale any givin picture which is below the size of 2048px, using the bigger.pics webiste (Free compute tastes yummy)"""
+from __future__ import annotations
+
+from sys import exit as bye
+from argparse import ArgumentParser
+from urllib import request
+from base64 import b64decode, b64encode
+from os import makedirs, path
+
+from colorama import init
+from camoufox.sync_api import Camoufox
+from fabs_lib import output, get_content_frame, log_event, tmp_path, log
+
+
+def browse(camoufox: Camoufox, image: bytes) -> tuple[bool, bytes | None]:
+    raw = None
+
+    try:
+        log_event("Starting the browser...", level="INFO")
+        browser = camoufox
+        context = browser.new_context(viewport={"width": 1920, "height": 1080})
+        page = context.new_page()
+
+        #-----IP address check-----#
+        log_event("Checking for IP address errors", level="INFO")
+        page.goto("http://api.ipify.org")
+        ip_addr = page.locator('pre').inner_text()
+        if ip_addr == request.urlopen('http://api.ipify.org').read().decode('utf-8'):
+            log_event(f"IP Address '{ip_addr}' is the ip address of your host and is being used as the ip addres of the browser, something might be wrong with the proxy configuration, please check!", level="WARNING")
+            if input("Should the upscaling be continued (y/N)? ").casefold() != "y":
+                browser.close()
+                return False, raw
+            else:
+                log_event("Continuing generation...", level="INFO")
+        log_event(f"VPN IP Address: {ip_addr}", level="INFO")
+
+        #-----Switching sites-----#
+        log_event("Navigating to bigger.pics", level="INFO")
+        page.goto("https://bigger.pics")
+
+        #-----Uploading picture-----#
+        log_event("Uploading the picture", level="INFO")
+        iframe = get_content_frame(page.locator("#app"))
+        iframe.locator("#file").set_input_files({"name": f"image.jpg", "mimeType": "image/jpeg", "buffer": image})
+
+        #-----Download file-----#
+        with page.expect_download() as download_info:
+            iframe.locator("a[class='button downloadMain']").click(timeout=60000)
+
+        download = download_info.value
+        file_path = download.path()
+
+        #-----Read the download-----#
+        with open(file_path, "rb") as f:
+            raw = f.read()
+
+        return True, raw
+
+    except Exception as e:
+        log_event(f"The script encounterd an unexcpected error: \n{e}", level="ERROR")
+        return False, raw
+
+
+def run() -> None:
+    parser = ArgumentParser()
+    parser.add_argument("image", help="The image to upscale (Base64 or Path)")
+    parser.add_argument("--gui", action="store_true", help="If the browser should be started with a gui")
+
+    output_type = parser.add_mutually_exclusive_group()
+    output_type.add_argument("-o", "--output-dir", type=str, help="Where the final image should be saved, if not specified the name of the image file will be image.jpg. The standard path is within /tmp so the image will not be saved accros reboots.")
+    output_type.add_argument("-b64", "--base64", action="store_true", help="Return the image as base64 instead of saving it to a path")
+    args = parser.parse_args()
+
+    if path.exists(args.image):
+        with open(args.image, "rb") as f:
+            image_bytes = f.read()
+    else:
+        try:
+            image_bytes = b64decode(args.image, validate=True)
+        except Exception as e:
+            log_event(f"the image input is neither a path nor a valid base64!", level="ERROR")
+            bye(1)
+
+    with Camoufox(humanize=True, headless=not args.gui, proxy={"server": "http://localhost:666"}) as browser:
+        data = browse(camoufox=browser, image=image_bytes)
+    if data[0]:
+        if args.base64:
+            output(b64encode(data[1]).decode("ascii"))
+        else:
+            if args.output_dir is None:
+                image_path = path.join(tmp_path("bigger_pics"), "image.jpg")
+            else:
+                if args.output_dir.endswith(".jpg"):
+                    image_path = args.output_dir
+                else:
+                    image_path = path.join(args.output_dir, "image.jpg")
+            makedirs(path.dirname(image_path) or ".", exist_ok=True)
+            with open(image_path, "wb") as f:
+                f.write(data[1])
+            log_event(f"Image saved in", end=" ", flush=True, level="SUCCESS")
+            output(image_path, end="", flush=True)
+            log(" !", flush=True)
+        bye(0)
+    else:
+        bye(1)
+
+
+if __name__ == "__main__":
+    init()
+    log_event("Initializing script...", level="INFO")
+    run()
