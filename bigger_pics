@@ -10,7 +10,9 @@ from os import makedirs, path
 
 from colorama import init
 from camoufox.sync_api import Camoufox
-from fabs_lib import output, get_content_frame, log_event, tmp_path, log
+from fabs_lib import log, output, tmp_path
+from fabs_lib_common import log_event
+from fabs_lib_playwright import get_content_frame
 
 
 def browse(camoufox: Camoufox, image: bytes) -> tuple[bool, bytes | None]:
