@@ -67,14 +67,14 @@ Here are the log details that prove this IP address conducted malicious actions:
 *This is an automated report. If you believe this is a mistake or need additional information, please contact fabs0612lol@gmail.com*
 
 Best regards,
-fail2ban system on fabs-gb.de
+fail2ban system on {getenv("domain")}
 """
 
 message = EmailMessage()
 message.set_content(email_template)
 message["Subject"] = "IP Address report"
 message["From"] = "noreply@fabs-gb.de"
-message["To"] = "fabs0612lol@gmail.com"
+message["To"] = abuse_email
 
 s = SMTP("smtp-relay.brevo.com", 587)
 s.starttls()

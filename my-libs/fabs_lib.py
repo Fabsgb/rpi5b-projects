@@ -8,10 +8,11 @@ from __future__ import annotations
 from sys import stderr, stdout
 from unicodedata import normalize, combining
 from datetime import datetime
-from os import path, makedirs, system
+from os import chmod, environ
 from platform import system as platform_system
 from getpass import getuser
-from secrets import token_urlsafe
+from subprocess import DEVNULL, run
+from tempfile import gettempdir, mkdtemp
 
 
 def output(msg: object, *, end: str = "\n", flush: bool = False) -> None:
@@ -46,26 +47,39 @@ def normalize_text(text: str) -> str:
 
 
 def now() -> str:
-    """Return the current local time following ISO-8601 as YYYY-MM-DDThh:mm:ss±hh:mm"""
+    """Return local time as ISO 8601 with second precision and a UTC offset."""
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def tmp_path(application: str) -> str:
+    """Create and return a unique, private temporary directory for an application."""
     platform = platform_system().casefold()
+    prefix = f"{application.replace('/', '_').replace('\\', '_')}_{getuser()}_"
     if platform == "linux":
-        path_tmp = f"/tmp/{application}_{getuser()}_{token_urlsafe(8)}"
-        while path.exists(path_tmp):
-            path_tmp = f"/tmp/{application}_{getuser()}_{token_urlsafe(8)}"
-        makedirs(path_tmp, exist_ok=True)
-        if system("setfacl -d -m u::rwx,g::,o:: " + path_tmp) != 0:
+        path_tmp = mkdtemp(prefix=prefix, dir="/tmp")
+        try:
+            result = run(
+                ["setfacl", "-d", "-m", "u::rwx,g::,o::", path_tmp],
+                check=False,
+                stdout=DEVNULL,
+                stderr=DEVNULL,
+            )
+        except OSError:
+            result = None
+        if result is None or result.returncode != 0:
             log("[WARNING] Could not use 'setfacl', using chmod as a fallback.")
-            system("chmod 2700 " + path_tmp)
+            chmod(path_tmp, 0o700)
     elif platform == "windows":
-        path_tmp = path.join(path.expandvars("%TEMP%"), f"{application}_{getuser()}_{token_urlsafe(8)}")
-        while path.exists(path_tmp):
-            path_tmp = path.join(path.expandvars("%TEMP%"), f"{application}_{getuser()}_{token_urlsafe(8)}")
-        makedirs(path_tmp, exist_ok=True)
-        system(r'icacls "' + path_tmp + '" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"')
+        path_tmp = mkdtemp(prefix=prefix, dir=gettempdir())
+        username = environ.get("USERNAME", getuser())
+        result = run(
+            ["icacls", path_tmp, "/inheritance:r", "/grant:r", f"{username}:(OI)(CI)F"],
+            check=False,
+            stdout=DEVNULL,
+            stderr=DEVNULL,
+        )
+        if result.returncode != 0:
+            log("[WARNING] Could not set temporary directory permissions with 'icacls'.")
     else:
         raise NotImplementedError(f"{platform} has not been implemented yet!")
 
