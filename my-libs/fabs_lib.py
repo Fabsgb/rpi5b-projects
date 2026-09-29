@@ -46,7 +46,7 @@ def normalize_text(text: str) -> str:
 
 
 def now() -> str:
-    """Return the current local time following ISO-8601 as a string."""
+    """Return the current local time following ISO-8601 as YYYY-MM-DDThh:mm:ss±hh:mm"""
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
