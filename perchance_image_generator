@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Script to automate image generation using the Perchance website.
-This script uses Camoufox to avoid bot detection (Grrrr)
-(I am deffinitely allowed to do this™)
+"""Generate images with Perchance and save or emit the resulting image data.
+
+Accepts generation prompts and options from the command line, collects the
+generated images from the page, and can optionally upscale them before saving
+JPEG files or writing Base64 data to stdout.
 """
 from __future__ import annotations
 
