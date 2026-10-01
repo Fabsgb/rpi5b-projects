@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Playwright helpers shared by browser-automation scripts."""
 from __future__ import annotations
 

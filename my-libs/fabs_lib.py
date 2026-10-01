@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Dependency-light utilities shared by my scripts.
 
 Playwright helpers and colored logging live in separate modules so scripts

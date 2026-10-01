@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Shared text-matching and colored-logging helpers."""
 from __future__ import annotations
 
