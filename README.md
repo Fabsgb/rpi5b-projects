@@ -4,6 +4,7 @@ Personal automation and utility scripts, primarily for Linux and Raspberry Pi sy
 
 <details>
   <summary><b>DISCLAIMER</b></summary>
+
   ## ⚠️ Disclaimer & Liability Waiver
 
   > This repository and all scripts and contents contained herein are provided **strictly for educational, learning, and personal automation purposes only**.
