@@ -95,7 +95,7 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
         log_event(f"VPN IP Address: {ip_addr}", level="INFO")
         if ip_addr == request.urlopen('http://api.ipify.org').read().decode('utf-8'):
             log_event(f"IP Address '{ip_addr}' is the ip address of your host, something might be wrong with the proxy configuration, please check!", level="ERROR")
-            if timed_input("Should the generation be continued (y/N)? ", timeout=30) == "n":
+            if timed_input("Should the generation be continued (y/N)? ", timeout=30) not in{"y", "yes"}:
                 browser.close()
                 return False, images
             else:
