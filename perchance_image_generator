@@ -27,7 +27,7 @@ from colorama import init
 from playwright.sync_api import Browser, BrowserContext, TimeoutError as PlaywrightTimeoutError
 from sympy import Symbol, sympify
 from fabs_lib import log, output
-from fabs_lib_common import log_event, match_choice
+from fabs_lib_common import log_event, match_choice, timed_input
 from fabs_lib_playwright import get_content_frame, human_typing
 
 
@@ -67,7 +67,10 @@ def upscale_image(image: bytes) -> bytes:
         timeout=300,
         check=True,
     )
-    return b64decode(result.stdout.strip(), validate=True)
+    upscaled_image = b64decode(result.stdout.strip(), validate=True)
+    if not upscaled_image:
+        raise ValueError("Upscaler returned empty image data.")
+    return upscaled_image
 
 
 def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str, shape: str, style: str, amount: int, timeout: float) -> tuple[bool, list[bytes]]:
@@ -92,7 +95,7 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
         log_event(f"VPN IP Address: {ip_addr}", level="INFO")
         if ip_addr == request.urlopen('http://api.ipify.org').read().decode('utf-8'):
             log_event(f"IP Address '{ip_addr}' is the ip address of your host, something might be wrong with the proxy configuration, please check!", level="ERROR")
-            if input("Should the generation be continued (y/N)? ").casefold() == "n":
+            if timed_input("Should the generation be continued (y/N)? ", timeout=30) == "n":
                 browser.close()
                 return False, images
             else:
@@ -299,14 +302,18 @@ def run() -> None:
         parser.add_argument("-st", "--style", type=partial(get_choice, options=styles), default=styles[0], help="The style of the image to generate.")
         parser.add_argument("-n", "--amount", type=match_number, default=numbers[0], help="The amount of images to generate, maximum=60.")
         parser.add_argument("-t", "--timeout", type=str, default="60 + n * 60", help="Maximum total time, in seconds, to wait for all generated images to appear before giving up. Can be a plain number, or an expression in terms of `n` -- the total number of images requested via --amount -- such as '60 + n * 60' to scale the global wait with the batch size.")
-        parser.add_argument("--gui", action="store_false", help="Run the script with a visible browser window (for debugging, do not use for production).")
+        parser.add_argument("--gui", action="store_true", help="Run the script with a visible browser window (for debugging, do not use for production).")
         parser.add_argument("-l", "--list", action="store_true", help="List all available styles, shapes, and amounts, then exit.")
         parser.add_argument("-u", "--upscale", action="store_true", help="Send the immage to bigger.pics and upscale it so that it longest side is 2048px.")
+        parser.add_argument("-i", "--info-file", action="store_true", help="Write a text file with the generation parameters next to the generated image(s).")
 
         output_type = parser.add_mutually_exclusive_group()
         output_type.add_argument("-o", "--output-dir", type=str, help="Where the final image should be saved, if not specified the name of the image file will be image.jpg. The standard path is within /tmp so the image will not be saved accros reboots.")
         output_type.add_argument("-b64", "--base-64", action="store_true", dest="base_64", help="Pass the final image as Base64 instead of saving it to a path.")
         args = parser.parse_args()
+
+        if args.info_file and args.base_64:
+            parser.error("Cannot use --info-file and --base-64 together; info file is only written when saving to disk.")
 
         if args.list:
             log_event(f"Available styles: {styles}", level="INFO")
@@ -346,15 +353,17 @@ def run() -> None:
             base_output_dir = output_dir[:-4] if output_dir.endswith(".jpg") else output_dir
 
         log_event("Starting Browser...", level="INFO")
-        with Camoufox(humanize=True, headless=args.gui, proxy={"server": "http://localhost:666"}) as camoufox:
+        with Camoufox(humanize=True, headless=not args.gui, proxy={"server": "http://localhost:666"}) as camoufox:
             success, images = browse(camoufox, args.prompt, args.negative_prompt, args.shape, args.style, args.amount, timeout_seconds)
 
         if success:
+            upscaled_amount = 0
             for index, image_bytes in enumerate(images, start=1):
                 if args.upscale:
                     log_event(f"Upscaling image {index} via bigger_pics...", level="INFO")
                     try:
                         image_bytes = upscale_image(image_bytes)
+                        upscaled_amount += 1
                         log_event(f"Image {index} upscaled successfully.", level="SUCCESS")
                     except TimeoutExpired:
                         log_event(f"Upscaling image {index} timed out; using original resolution.", level="ERROR")
@@ -375,7 +384,7 @@ def run() -> None:
                     output(current_output_path, flush=True, end="")
                     log(" !", flush=True)
 
-            if not args.base_64:
+            if args.info_file:
                 log_event("Writing info file...", level="INFO")
                 split_output_dir = base_output_dir.rsplit("image", 1)
                 with open("info.txt".join(split_output_dir), "w") as f:
@@ -384,7 +393,7 @@ def run() -> None:
                     f.write(f"Shape: {args.shape}\n")
                     f.write(f"Style: {args.style}\n")
                     f.write(f"Amount: {args.amount}\n")
-                    f.write(f"Upscaled: {args.upscale}")
+                    f.write(f"Upscaled: {args.upscale} ({upscaled_amount}/{args.amount})")
             log_event("Finished image generation process; Exiting script.", level="SUCCESS")
             bye(0)
         else:
