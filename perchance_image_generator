@@ -95,11 +95,12 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
         log_event(f"VPN IP Address: {ip_addr}", level="INFO")
         if ip_addr == request.urlopen('http://api.ipify.org').read().decode('utf-8'):
             log_event(f"IP Address '{ip_addr}' is the ip address of your host, something might be wrong with the proxy configuration, please check!", level="ERROR")
-            if timed_input("Should the generation be continued (y/N)? ", timeout=30) not in{"y", "yes"}:
+            if (timed_input("Should the generation be continued (y/N)? ", timeout=30) or "").casefold() not in {"y", "yes"}:
                 browser.close()
                 return False, images
             else:
                 log_event("Continuing generation...", level="INFO")
+
         #-----Switching sites-----#
         page.goto("https://perchance.org/lemheealw3")
         log_event("Loading site...", level="INFO")
@@ -306,6 +307,7 @@ def run() -> None:
         parser.add_argument("-l", "--list", action="store_true", help="List all available styles, shapes, and amounts, then exit.")
         parser.add_argument("-u", "--upscale", action="store_true", help="Send the immage to bigger.pics and upscale it so that it longest side is 2048px.")
         parser.add_argument("-i", "--info-file", action="store_true", help="Write a text file with the generation parameters next to the generated image(s).")
+        parser.add_argument("-p", "--preview", action="store_true", help="Display the generated image(s) in the terminal using chafa.")
 
         output_type = parser.add_mutually_exclusive_group()
         output_type.add_argument("-o", "--output-dir", type=str, help="Where the final image should be saved, if not specified the name of the image file will be image.jpg. The standard path is within /tmp so the image will not be saved accros reboots.")
@@ -314,6 +316,12 @@ def run() -> None:
 
         if args.info_file and args.base_64:
             parser.error("Cannot use --info-file and --base-64 together; info file is only written when saving to disk.")
+
+        if args.preview and args.base_64:
+            log_event("Displaying the image will use chafa which uses stdout, this may corrupt the output if auromatic systems try to read it.", level="WARNING")
+            if (timed_input("Do you want to continue (y/N)? ", timeout=30) or "").casefold() not in {"y", "yes"}:
+                log_event("Exiting script due to user choice.", level="INFO")
+                bye(0)
 
         if args.list:
             log_event(f"Available styles: {styles}", level="INFO")
@@ -383,6 +391,18 @@ def run() -> None:
                     log_event(f"Image {index} saved successfully in", level="SUCCESS", flush=True, end=" ")
                     output(current_output_path, flush=True, end="")
                     log(" !", flush=True)
+
+                if args.preview:
+                    if args.base_64:
+                        try:
+                            subprocess_run(["chafa", "-"], input=image_bytes, check=True)
+                        except Exception as e:
+                            log_event(f"Failed to render image {index} with chafa: {e}", level="ERROR")
+                    else:
+                        try:
+                            subprocess_run(["chafa", current_output_path], check=True)
+                        except Exception as e:
+                            log_event(f"Failed to render image {index} with chafa: {e}", level="ERROR")
 
             if args.info_file:
                 log_event("Writing info file...", level="INFO")
