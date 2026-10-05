@@ -13,13 +13,13 @@ from base64 import b64decode, b64encode
 from datetime import datetime as dt
 from functools import partial
 from getpass import getuser
-from os import makedirs, path, system
+from os import chmod, makedirs, path, walk
 from platform import system as platform_system
 import re
 from secrets import token_urlsafe
 from subprocess import run as subprocess_run, CalledProcessError, TimeoutExpired
 from sys import exit as bye
-from time import sleep, time
+from time import monotonic, sleep
 from urllib import request
 
 from camoufox.sync_api import Camoufox
@@ -35,8 +35,7 @@ def unix_sec() -> str:
     return dt.now().astimezone().strftime('%s')
 
 
-def match_number(wanted_number: str) -> str:
-    global numbers
+def match_number(wanted_number: str, numbers: list[str]) -> str:
     for number in numbers:
         if number == wanted_number:
             return number
@@ -44,27 +43,59 @@ def match_number(wanted_number: str) -> str:
 
 
 def get_choice(wanted_choice: str, options: list[str]) -> str:
-    """Try to match the option with an allowed one, if the match fails, the standart will be used."""
+    """Try to match the option with an allowed one, if the match fails, the standard will be used."""
+    if not options:
+        raise ArgumentTypeError("No dynamic options are available.")
     try:
         return match_choice(wanted_choice, options)
     except ValueError:
         return options[0]
 
 
-def upscale_image(image: bytes) -> bytes:
+class OperationTimeoutError(TimeoutError):
+    """Raised when the generation-wide deadline expires."""
+
+
+def remaining_time(deadline: float) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise OperationTimeoutError("Global timeout reached.")
+    return remaining
+
+
+def remaining_timeout_ms(deadline: float) -> int:
+    return max(1, int(remaining_time(deadline) * 1000))
+
+
+def raise_walk_error(error: OSError) -> None:
+    raise error
+
+
+def chmod_tree(directory: str, mode: int) -> None:
+    """Apply a chmod mode to a directory and every entry beneath it."""
+    for current_directory, directories, files in walk(directory, onerror=raise_walk_error):
+        chmod(current_directory, mode)
+        for entry in files:
+            entry_path = path.join(current_directory, entry)
+            if not path.islink(entry_path):
+                chmod(entry_path, mode)
+
+
+def upscale_image(image: bytes, deadline: float) -> bytes:
     """Send an image to /home/server/scripts/bigger_pics for upscaling.
 
     Blocks until the external script finishes, then returns the upscaled
     image bytes decoded from the script's Base64 output.
 
     Raises CalledProcessError if the script exits non-zero, or
-    TimeoutExpired if it does not finish within the allotted time.
+    TimeoutExpired if it does not finish before the global deadline.
     """
+    command = ["/home/server/scripts/bigger_pics", "-b64", b64encode(image).decode("ascii")]
     result = subprocess_run(
-        ["/home/server/scripts/bigger_pics", "-b64", b64encode(image).decode("ascii")],
+        command,
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=remaining_time(deadline),
         check=True,
     )
     upscaled_image = b64decode(result.stdout.strip(), validate=True)
@@ -73,15 +104,27 @@ def upscale_image(image: bytes) -> bytes:
     return upscaled_image
 
 
-def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str, shape: str, style: str, amount: int, timeout: float) -> tuple[bool, list[bytes]]:
+def browse(
+    camoufox: Browser | BrowserContext,
+    prompt: str,
+    negative_prompt: str,
+    shape: str | None,
+    style: str | None,
+    default_style: str | None,
+    amount: int,
+    timeout: float,
+    tmp_path: str,
+    select_dropdowns: bool,
+) -> tuple[bool, list[bytes], float]:
     """Generate images in Perchance and return their raw bytes.
 
-    `timeout` is the maximum total time, in seconds, to wait for ALL
-    generated images to appear in the DOM before giving up.
+    `timeout` is the maximum total time, in seconds, for generation,
+    upscaling, and writing the image files.
 
     The browser interaction stays in this function; callers decide whether to
     upscale, save, or emit the returned images.
     """
+    deadline = monotonic() + timeout
     amount_int = int(amount)
     amount_str = str(amount)
     browser = camoufox
@@ -89,29 +132,38 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
 
     try:
         page = browser.new_page()
+        page.set_default_timeout(remaining_timeout_ms(deadline))
+        page.set_default_navigation_timeout(remaining_timeout_ms(deadline))
 
-        page.goto("http://api.ipify.org")
+        page.goto("http://api.ipify.org", timeout=remaining_timeout_ms(deadline))
+        page.set_default_timeout(remaining_timeout_ms(deadline))
         ip_addr = page.locator('pre').inner_text()
         log_event(f"VPN IP Address: {ip_addr}", level="INFO")
-        if ip_addr == request.urlopen('http://api.ipify.org').read().decode('utf-8'):
+        if ip_addr == request.urlopen('http://api.ipify.org', timeout=remaining_time(deadline)).read().decode('utf-8'):
             log_event(f"IP Address '{ip_addr}' is the ip address of your host, something might be wrong with the proxy configuration, please check!", level="ERROR")
-            if (timed_input("Should the generation be continued (y/N)? ", timeout=30) or "").casefold() not in {"y", "yes"}:
+            if (timed_input("Should the generation be continued (y/N)? ", timeout=min(30, remaining_time(deadline))) or "").casefold() not in {"y", "yes"}:
                 browser.close()
-                return False, images
+                return False, images, deadline
             else:
                 log_event("Continuing generation...", level="INFO")
 
         #-----Switching sites-----#
-        page.goto("https://perchance.org/lemheealw3")
+        page.goto("https://perchance.org/lemheealw3", timeout=remaining_timeout_ms(deadline))
         log_event("Loading site...", level="INFO")
 
         #-----Finding the image generator-----#
+        page.set_default_timeout(remaining_timeout_ms(deadline))
         frame = get_content_frame(page.locator("#outputIframeEl"))
 
         #-----Closing existing dialogs-----#
+        page.set_default_timeout(remaining_timeout_ms(deadline))
         for dialog in frame.locator("dialog[open]").all():
             try:
-                dialog.locator("button, .close, [aria-label='Close']").first.click(timeout=10000, force=True)
+                page.set_default_timeout(remaining_timeout_ms(deadline))
+                dialog.locator("button, .close, [aria-label='Close']").first.click(
+                    timeout=min(10000, remaining_timeout_ms(deadline)),
+                    force=True,
+                )
                 log_event("Closed a dialog via button click.", level="INFO")
             except PlaywrightTimeoutError:
                 log_event("Button click failed for a dialog, trying JS fallback.", level="WARNING")
@@ -125,7 +177,9 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
 
         #-----Filling in generation options-----#
         try:
+            page.set_default_timeout(remaining_timeout_ms(deadline))
             frame.locator('textarea[data-name="description"]').click(force=True)
+            page.set_default_timeout(remaining_timeout_ms(deadline))
             human_typing(locator=frame.locator('textarea[data-name="description"]'), text=prompt)
             log_event("Filled in positive prompt.", level="INFO")
         except Exception as e:
@@ -135,33 +189,41 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
             raise e
 
         if negative_prompt:
+            page.set_default_timeout(remaining_timeout_ms(deadline))
             frame.locator('textarea[data-name="negative"]').click()
+            page.set_default_timeout(remaining_timeout_ms(deadline))
             human_typing(locator=frame.locator('textarea[data-name="negative"]'), text=negative_prompt)
             log_event("Filled in negative prompt.", level="INFO")
         else:
             log_event("No negative prompt provided; skipping.", level="INFO")
 
-        if shape != "portrait":
+        if select_dropdowns and shape is not None and shape != "portrait":
             try:
+                page.set_default_timeout(remaining_timeout_ms(deadline))
                 frame.locator('select[data-name="shape"]').click()
+                page.set_default_timeout(remaining_timeout_ms(deadline))
                 frame.locator('select[data-name="shape"]').select_option(shape)
                 log_event(f"Selected shape: {shape}", level="INFO")
             except PlaywrightTimeoutError as e:
                 log_event(f"Error while selecting shape: {e}", level="ERROR")
                 log_event("Using default shape.", level="ERROR")
 
-        if style != styles[0]:
+        if select_dropdowns and style is not None and style != default_style:
             try:
+                page.set_default_timeout(remaining_timeout_ms(deadline))
                 frame.locator('select[data-name="artStyle"]').click()
+                page.set_default_timeout(remaining_timeout_ms(deadline))
                 frame.locator('select[data-name="artStyle"]').select_option(style)
                 log_event(f"Selected style: {style}", level="INFO")
             except PlaywrightTimeoutError as e:
                 log_event(f"Error while selecting style: {e}", level="ERROR")
                 log_event("Using default style.", level="ERROR")
 
-        if amount_str != "1":
+        if select_dropdowns and amount_str != "1":
             try:
+                page.set_default_timeout(remaining_timeout_ms(deadline))
                 frame.locator('select[data-name="numImages"]').click()
+                page.set_default_timeout(remaining_timeout_ms(deadline))
                 frame.locator('select[data-name="numImages"]').select_option(amount_str)
                 log_event(f"Selected amount: {amount_int}", level="INFO")
             except PlaywrightTimeoutError as e:
@@ -169,20 +231,17 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
                 log_event("Using default amount.", level="ERROR")
 
         #-----Starting generation-----#
-        frame.locator("#generateButtonEl").click()
+        page.set_default_timeout(remaining_timeout_ms(deadline))
+        frame.locator("#generateButtonEl").click(timeout=remaining_timeout_ms(deadline))
         log_event("Starting generation and waiting for the image element(s) in DOM...", level="INFO")
 
         try:
-            end_time = time() + timeout
             content_guard_bypassed = False
 
             #-----Collecting generated images-----#
             for i in range(amount_int):
                 try:
-                    remaining_time = end_time - time()
-                    if remaining_time <= 0:
-                        log_event("Global timeout reached. Stopping wait for remaining images.", level="ERROR")
-                        break
+                    page.set_default_timeout(remaining_timeout_ms(deadline))
 
                     image_iframe_locator = frame.locator("iframe.text-to-image-plugin-image-iframe").nth(i)
                     iframe_ctx = get_content_frame(image_iframe_locator)
@@ -196,29 +255,34 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
                     image_src = ""
 
                     # Poll until the image is ready or the batch deadline is reached.
-                    while time() < end_time:
+                    while True:
+                        page.set_default_timeout(remaining_timeout_ms(deadline))
                         if not content_guard_bypassed and guard_locator.is_visible():
                             log_event(f"Content guard detected on image {i+1}! Attempting bypass...", level="INFO")
                             try:
-                                interaction_timeout = 15000
-
                                 gear_btn = iframe_ctx.locator("#contentGuardMessageEl button").first
-                                gear_btn.click(timeout=interaction_timeout)
+                                gear_btn.click(timeout=min(15000, remaining_timeout_ms(deadline)))
 
                                 select_el = iframe_ctx.locator("#contentGuardSettingsSelectEl").first
-                                select_el.select_option("315360000000", timeout=interaction_timeout)
+                                select_el.select_option(
+                                    "315360000000",
+                                    timeout=min(15000, remaining_timeout_ms(deadline)),
+                                )
 
                                 checkbox = iframe_ctx.locator("#contentGuardOver18CheckboxEl").first
-                                checkbox.check(timeout=interaction_timeout)
+                                checkbox.check(timeout=min(15000, remaining_timeout_ms(deadline)))
 
                                 save_btn = iframe_ctx.locator("#contentGuardSettingsEl button").first
-                                save_btn.click(timeout=interaction_timeout)
+                                save_btn.click(timeout=min(15000, remaining_timeout_ms(deadline)))
 
                                 log_event("Content guard UI bypass successful.", level="INFO")
                                 content_guard_bypassed = True
                             except Exception as e:
+                                if isinstance(e, OperationTimeoutError):
+                                    raise
                                 log_event(f"UI bypass failed ({e}), trying JS fallback...", level="WARNING")
                                 try:
+                                    remaining_time(deadline)
                                     iframe_ctx.evaluate('''() => {
                                         const select = document.getElementById("contentGuardSettingsSelectEl");
                                         const checkbox = document.getElementById("contentGuardOver18CheckboxEl");
@@ -236,6 +300,8 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
                                     log_event("Content guard JS fallback successful.", level="INFO")
                                     content_guard_bypassed = True
                                 except Exception as js_e:
+                                    if isinstance(js_e, OperationTimeoutError):
+                                        raise
                                     log_event(f"JS fallback failed: {js_e}", level="ERROR")
 
                         if generated_image_locator.is_visible():
@@ -256,6 +322,7 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
                     match = re.search(r'base64,([A-Za-z0-9+/=]+)', image_src)
 
                     if match:
+                        remaining_time(deadline)
                         image_bytes = b64decode(match.group(1), validate=True)
                         images.append(image_bytes)
                         log_event(f"Image {i+1} data collected successfully.", level="SUCCESS")
@@ -263,21 +330,35 @@ def browse(camoufox: Browser | BrowserContext, prompt: str, negative_prompt: str
                         log_event(f"Image {i+1} 'src' attribute contains data:image, but is not valid base64.", level="ERROR")
 
                 except Exception as e:
+                    if isinstance(e, OperationTimeoutError):
+                        raise
                     log_event(f"Error or timeout while processing image {i+1} in DOM: {e}", level="ERROR")
 
         except Exception as e:
+            if isinstance(e, OperationTimeoutError):
+                raise
             log_event(f"Error during extraction loop: {e}", level="ERROR")
-
+    except OperationTimeoutError as e:
+        log_event(str(e), level="ERROR")
+    except TimeoutError as e:
+        if monotonic() >= deadline:
+            log_event(f"Global timeout reached during browser interaction: {e}", level="ERROR")
+        else:
+            raise
+    except PlaywrightTimeoutError as e:
+        if monotonic() >= deadline:
+            log_event(f"Global timeout reached during browser interaction: {e}", level="ERROR")
+        else:
+            raise
     finally:
         browser.close()
-        system(f"chmod -R 700 {tmp_path}")
+        if path.isdir(tmp_path):
+            chmod_tree(tmp_path, 0o700)
 
-    return bool(images), images
+    return bool(images), images, deadline
 
 
 def run() -> None:
-    global numbers, shapes, styles, tmp_path
-
     try:
         if platform_system().casefold() == "linux":
             tmp_path = "/tmp/perchance_" + getuser()
@@ -287,50 +368,79 @@ def run() -> None:
             log_event(f"Unsupported platform: {platform_system()}", level="ERROR")
             bye(1)
 
-        with open(f"{tmp_path}/styles.txt", "r") as f:
-            styles = literal_eval(f.read())
+        override_parser = ArgumentParser(add_help=False)
+        override_parser.add_argument("-o", "--override", action="store_true")
+        override_args, _ = override_parser.parse_known_args()
 
-        with open(f"{tmp_path}/shapes.txt", "r") as f:
-            shapes = literal_eval(f.read())
+        styles: list[str] = []
+        shapes: list[str] = []
+        numbers: list[str] = []
+        if not override_args.override and path.exists(f"{tmp_path}/styles.txt"):
+            log_event("Reading available styles...", level="INFO")
+            with open(f"{tmp_path}/styles.txt", "r") as f:
+                styles = literal_eval(f.read())
+        elif not override_args.override:
+            log_event("The list of available styles is not available!", level="ERROR")
 
-        with open(f"{tmp_path}/numbers.txt", "r") as f:
-            numbers = literal_eval(f.read())
+        if not override_args.override and path.exists(f"{tmp_path}/shapes.txt"):
+            log_event("Reading available shapes...", level="INFO")
+            with open(f"{tmp_path}/shapes.txt", "r") as f:
+                shapes = literal_eval(f.read())
+        elif not override_args.override:
+            log_event("The list of available shapes is not available!", level="ERROR")
+
+        if not override_args.override and path.exists(f"{tmp_path}/numbers.txt"):
+            log_event("Reading available generation amounts...", level="INFO")
+            with open(f"{tmp_path}/numbers.txt", "r") as f:
+                numbers = literal_eval(f.read())
+        elif not override_args.override:
+            log_event("The list of available generation amounts is not available!", level="ERROR")
 
         parser = ArgumentParser(description="Automate image generation.")
         parser.add_argument("-p", "--prompt", type=str, required=True, help="The main prompt used to generate the image.")
         parser.add_argument("-np", "--negative-prompt", type=str, default="", help="Things which should not be inside the image.")
-        parser.add_argument("-s", "--shape", type=partial(get_choice, options=shapes), default=shapes[0], help="The shape of the image to generate.")
-        parser.add_argument("-st", "--style", type=partial(get_choice, options=styles), default=styles[0], help="The style of the image to generate.")
-        parser.add_argument("-n", "--amount", type=match_number, default=numbers[0], help="The amount of images to generate, maximum=60.")
-        parser.add_argument("-t", "--timeout", type=str, default="60 + n * 60", help="Maximum total time, in seconds, to wait for all generated images to appear before giving up. Can be a plain number, or an expression in terms of `n` -- the total number of images requested via --amount -- such as '60 + n * 60' to scale the global wait with the batch size.")
+        parser.add_argument("-s", "--shape", type=str if override_args.override else partial(get_choice, options=shapes), default=None if override_args.override else (shapes[0] if shapes else None), help="The shape of the image to generate.")
+        parser.add_argument("-st", "--style", type=str if override_args.override else partial(get_choice, options=styles), default=None if override_args.override else (styles[0] if styles else None), help="The style of the image to generate.")
+        parser.add_argument("-n", "--amount", type=int if override_args.override else partial(match_number, numbers=numbers), default=1 if override_args.override else (numbers[0] if numbers else "1"), help="The amount of images to generate.")
+        parser.add_argument("-t", "--timeout", type=str, default="60 + n * 60 + n * u * 15", help="Maximum total time, in seconds, from browse() starting through generation, optional upscaling, and writing the image files. Can be a plain number or an expression in terms of `n` (image count) and `u` (1 when upscaling, otherwise 0).")
         parser.add_argument("--gui", action="store_true", help="Run the script with a visible browser window (for debugging, do not use for production).")
         parser.add_argument("-l", "--list", action="store_true", help="List all available styles, shapes, and amounts, then exit.")
-        parser.add_argument("-u", "--upscale", action="store_true", help="Send the immage to bigger.pics and upscale it so that it longest side is 2048px.")
+        parser.add_argument("-u", "--upscale", action="store_true", help="Send the image to bigger.pics and upscale it so that it longest side is 2048px.")
         parser.add_argument("-i", "--info-file", action="store_true", help="Write a text file with the generation parameters next to the generated image(s).")
-        parser.add_argument("-pr", "--preview", action="store_true", help="Display the generated image(s) in the terminal using chafa.")
+        parser.add_argument("-v", "--preview", action="store_true", help="Display the generated image(s) in the terminal using chafa.")
+        parser.add_argument("-o", "--override", action="store_true", help="Skip loading dynamic options and leave the shape, style, and amount dropdowns unchanged.")
 
         output_type = parser.add_mutually_exclusive_group()
-        output_type.add_argument("-o", "--output-dir", type=str, help="Where the final image should be saved, if not specified the name of the image file will be image.jpg. The standard path is within /tmp so the image will not be saved accros reboots.")
+        output_type.add_argument("-d", "--output-dir", type=str, help="Where the final image should be saved, if not specified the name of the image file will be image.jpg. The standard path is within /tmp so the image will not be saved across reboots.")
         output_type.add_argument("-b64", "--base-64", action="store_true", dest="base_64", help="Pass the final image as Base64 instead of saving it to a path.")
         args = parser.parse_args()
+
+        if not args.override:
+            if not styles or not shapes or not numbers:
+                parser.error("Dynamic options are missing or empty; use --override to skip loading them.")
+            args.amount = match_number(args.amount, numbers)
+        else:
+            args.amount = str(args.amount)
 
         if args.info_file and args.base_64:
             parser.error("Cannot use --info-file and --base-64 together; info file is only written when saving to disk.")
 
         if args.preview and args.base_64:
-            log_event("Displaying the image will use chafa which uses stdout, this may corrupt the output if auromatic systems try to read it.", level="WARNING")
+            log_event("Displaying the image will use chafa which uses stdout, this may corrupt the output if automatic systems try to read it.", level="WARNING")
             if (timed_input("Do you want to continue (y/N)? ", timeout=30) or "").casefold() not in {"y", "yes"}:
                 log_event("Exiting script due to user choice.", level="INFO")
                 bye(0)
 
         if args.list:
+            if args.override:
+                parser.error("--list is unavailable with --override because the option files are not loaded.")
             log_event(f"Available styles: {styles}", level="INFO")
             log_event(f"Available shapes: {shapes}", level="INFO")
             log_event(f"Available amounts: {numbers}", level="INFO")
             bye(0)
 
         try:
-            timeout_seconds = float(sympify(args.timeout).subs(Symbol("n"), args.amount))
+            timeout_seconds = float(sympify(args.timeout).subs({Symbol("n"): args.amount, Symbol("u"): int(args.upscale)}))
         except Exception as e:
             log_event(f"Invalid --timeout expression '{args.timeout}': {e}", level="ERROR")
             bye(1)
@@ -352,7 +462,7 @@ def run() -> None:
             if not output_dir.endswith(".jpg"):
                 output_dir = path.join(output_dir, "image.jpg")
             makedirs(path.dirname(output_dir), exist_ok=True)
-            system(f"chmod 2700 {tmp_path}")
+            chmod(tmp_path, 0o2700)
         else:
             output_dir = "None"
 
@@ -362,31 +472,75 @@ def run() -> None:
 
         log_event("Starting Browser...", level="INFO")
         with Camoufox(humanize=True, headless=not args.gui, proxy={"server": "http://localhost:666"}) as camoufox:
-            success, images = browse(camoufox, args.prompt, args.negative_prompt, args.shape, args.style, args.amount, timeout_seconds)
+            success, images, deadline = browse(
+                camoufox,
+                args.prompt,
+                args.negative_prompt,
+                args.shape,
+                args.style,
+                None if args.override else styles[0],
+                int(args.amount),
+                timeout_seconds,
+                tmp_path,
+                select_dropdowns=not args.override,
+            )
 
         if success:
             upscaled_amount = 0
+            operation_timed_out = False
+            current_output_path = ""
             for index, image_bytes in enumerate(images, start=1):
+                try:
+                    remaining_time(deadline)
+                except OperationTimeoutError:
+                    log_event("Global timeout reached before all images were written.", level="ERROR")
+                    operation_timed_out = True
+                    break
+
                 if args.upscale:
                     log_event(f"Upscaling image {index} via bigger_pics...", level="INFO")
                     try:
-                        image_bytes = upscale_image(image_bytes)
+                        image_bytes = upscale_image(image_bytes, deadline)
                         upscaled_amount += 1
                         log_event(f"Image {index} upscaled successfully.", level="SUCCESS")
                     except TimeoutExpired:
-                        log_event(f"Upscaling image {index} timed out; using original resolution.", level="ERROR")
+                        log_event(f"Global timeout reached while upscaling image {index}; stopping.", level="ERROR")
+                        operation_timed_out = True
+                        break
                     except CalledProcessError as e:
                         log_event(f"Upscaling image {index} failed (exit code {e.returncode}): {e.stderr.strip() if e.stderr else 'no stderr'}; using original resolution.", level="ERROR")
                     except Exception as e:
+                        if isinstance(e, OperationTimeoutError):
+                            log_event(f"Global timeout reached while upscaling image {index}; stopping.", level="ERROR")
+                            operation_timed_out = True
+                            break
                         log_event(f"Unexpected error while upscaling image {index}: {e}; using original resolution.", level="ERROR")
 
                 if args.base_64:
+                    try:
+                        remaining_time(deadline)
+                    except OperationTimeoutError:
+                        log_event("Global timeout reached before image output.", level="ERROR")
+                        operation_timed_out = True
+                        break
                     log_event(f"Returning image {index} as Base64 string.", level="SUCCESS")
                     output(b64encode(image_bytes).decode("ascii"), flush=True)
                 else:
                     current_output_path = f"{base_output_dir}_{index}.jpg" if int(args.amount) > 1 else f"{base_output_dir}.jpg"
+                    try:
+                        remaining_time(deadline)
+                    except OperationTimeoutError:
+                        log_event("Global timeout reached before writing the image file.", level="ERROR")
+                        operation_timed_out = True
+                        break
                     with open(current_output_path, "wb") as f:
                         f.write(image_bytes)
+                    try:
+                        remaining_time(deadline)
+                    except OperationTimeoutError:
+                        log_event(f"Global timeout reached while writing image {index}; stopping.", level="ERROR")
+                        operation_timed_out = True
+                        break
 
                     log_event(f"Image {index} saved successfully in", level="SUCCESS", flush=True, end=" ")
                     output(current_output_path, flush=True, end="")
@@ -403,6 +557,10 @@ def run() -> None:
                             subprocess_run(["chafa", current_output_path], check=True)
                         except Exception as e:
                             log_event(f"Failed to render image {index} with chafa: {e}", level="ERROR")
+
+            if operation_timed_out:
+                log_event("Global timeout reached before the image batch was fully processed.", level="ERROR")
+                bye(1)
 
             if args.info_file:
                 log_event("Writing info file...", level="INFO")
