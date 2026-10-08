@@ -17,13 +17,15 @@
 #
 import base64
 import subprocess
+from os import environ
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Response
 
 app = FastAPI()
 
 # Make sure this points to your actual script
-SCRIPT_PATH = "/home/server/scripts/perchance_image_generator"
+SCRIPT_PATH = Path(__file__).parent / "perchance_image_generator"
 
 MIN_AMOUNT = 1
 MAX_AMOUNT = 60
@@ -54,6 +56,7 @@ def generate(
         "--prompt", prompt,
         "--base-64",
         "--amount", str(amount),
+        "-u"
     ]
     if negative_prompt:
         cmd.extend(["--negative-prompt", negative_prompt])
@@ -63,12 +66,15 @@ def generate(
         cmd.extend(["--style", style])
 
     try:
+        env = environ.copy()
+        env["PYTHONPATH"] = f"{Path(__file__).parent.resolve()}/my-libs" #I got a error sometimes that the libs arent found
         process = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             check=False,
             timeout=timeout,
+            env=env
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=504, detail="Image generation timed out.")
