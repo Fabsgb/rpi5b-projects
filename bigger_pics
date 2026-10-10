@@ -18,7 +18,7 @@
 #
 from __future__ import annotations
 
-from sys import exit as bye
+from sys import exit as bye, stdin
 from argparse import ArgumentParser
 from urllib import request
 from base64 import b64decode, b64encode
@@ -82,7 +82,7 @@ def browse(camoufox: Camoufox, image: bytes) -> tuple[bool, bytes | None]:
 
 def run() -> None:
     parser = ArgumentParser()
-    parser.add_argument("image", help="The image to upscale (Base64 or Path)")
+    parser.add_argument("-i", "--image", type=str, help="The image to upscale (Base64 or Path). If omitted, read Base64 from stdin.")
     parser.add_argument("--gui", action="store_true", help="If the browser should be started with a gui")
 
     output_type = parser.add_mutually_exclusive_group()
@@ -90,12 +90,17 @@ def run() -> None:
     output_type.add_argument("-b64", "--base64", action="store_true", help="Return the image as base64 instead of saving it to a path")
     args = parser.parse_args()
 
-    if path.exists(args.image):
-        with open(args.image, "rb") as f:
+    image_input = args.image if args.image is not None else stdin.read().strip()
+    if not image_input:
+        log_event("No image provided; pass --image or provide Base64 data on stdin.", level="INFO")
+        bye(1)
+
+    if path.exists(image_input):
+        with open(image_input, "rb") as f:
             image_bytes = f.read()
     else:
         try:
-            image_bytes = b64decode(args.image, validate=True)
+            image_bytes = b64decode(image_input, validate=True)
         except Exception as e:
             log_event(f"the image input is neither a path nor a valid base64!", level="ERROR")
             bye(1)

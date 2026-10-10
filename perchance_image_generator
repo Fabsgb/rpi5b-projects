@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Generate images with Perchance and save or emit the resulting image data.
 
+You can use { Option one | Option two } to randomly select between options.
+
 Accepts generation prompts and options from the command line, collects the
 generated images from the page, and can optionally upscale them before saving
 JPEG files or writing Base64 data to stdout.
@@ -26,6 +28,7 @@ from __future__ import annotations
 from argparse import ArgumentParser, ArgumentTypeError
 from ast import literal_eval
 from base64 import b64decode, b64encode
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime as dt
 from functools import partial
 from getpass import getuser
@@ -36,6 +39,7 @@ from secrets import token_urlsafe
 from subprocess import run as subprocess_run, CalledProcessError, TimeoutExpired
 from sys import exit as bye
 from time import monotonic, sleep
+from typing import Callable
 from urllib import request
 
 from camoufox.sync_api import Camoufox
@@ -106,9 +110,10 @@ def upscale_image(image: bytes, deadline: float) -> bytes:
     Raises CalledProcessError if the script exits non-zero, or
     TimeoutExpired if it does not finish before the global deadline.
     """
-    command = ["/home/server/scripts/bigger_pics", "-b64", b64encode(image).decode("ascii")]
+    command = ["/home/server/scripts/bigger_pics", "-b64"]
     result = subprocess_run(
         command,
+        input=b64encode(image).decode("ascii"),
         capture_output=True,
         text=True,
         timeout=remaining_time(deadline),
@@ -131,14 +136,15 @@ def browse(
     timeout: float,
     tmp_path: str,
     select_dropdowns: bool,
+    on_image_ready: Callable[[bytes, float], None] | None = None,
 ) -> tuple[bool, list[bytes], float]:
     """Generate images in Perchance and return their raw bytes.
 
     `timeout` is the maximum total time, in seconds, for generation,
     upscaling, and writing the image files.
 
-    The browser interaction stays in this function; callers decide whether to
-    upscale, save, or emit the returned images.
+    `on_image_ready`, when provided, is called as soon as each image's bytes
+    have been collected.
     """
     deadline = monotonic() + timeout
     amount_int = int(amount)
@@ -341,6 +347,8 @@ def browse(
                         remaining_time(deadline)
                         image_bytes = b64decode(match.group(1), validate=True)
                         images.append(image_bytes)
+                        if on_image_ready is not None:
+                            on_image_ready(image_bytes, deadline)
                         log_event(f"Image {i+1} data collected successfully.", level="SUCCESS")
                     else:
                         log_event(f"Image {i+1} 'src' attribute contains data:image, but is not valid base64.", level="ERROR")
@@ -354,17 +362,13 @@ def browse(
             if isinstance(e, OperationTimeoutError):
                 raise
             log_event(f"Error during extraction loop: {e}", level="ERROR")
-    except OperationTimeoutError as e:
-        log_event(str(e), level="ERROR")
-    except TimeoutError as e:
-        if monotonic() >= deadline:
-            log_event(f"Global timeout reached during browser interaction: {e}", level="ERROR")
-        else:
+    except OperationTimeoutError:
+        pass
+    except TimeoutError:
+        if monotonic() < deadline:
             raise
-    except PlaywrightTimeoutError as e:
-        if monotonic() >= deadline:
-            log_event(f"Global timeout reached during browser interaction: {e}", level="ERROR")
-        else:
+    except PlaywrightTimeoutError:
+        if monotonic() < deadline:
             raise
     finally:
         browser.close()
@@ -487,76 +491,58 @@ def run() -> None:
             base_output_dir = output_dir[:-4] if output_dir.endswith(".jpg") else output_dir
 
         log_event("Starting Browser...", level="INFO")
-        with Camoufox(humanize=True, headless=not args.gui, proxy={"server": "http://localhost:666"}) as camoufox:
-            success, images, deadline = browse(
-                camoufox,
-                args.prompt,
-                args.negative_prompt,
-                args.shape,
-                args.style,
-                None if args.override else styles[0],
-                int(args.amount),
-                timeout_seconds,
-                tmp_path,
-                select_dropdowns=not args.override,
-            )
+        upscale_futures: list[Future[bytes]] = []
+        with ThreadPoolExecutor(max_workers=1) as upscale_executor:
+            def start_upscaling(image_bytes: bytes, deadline: float) -> None:
+                log_event(f"Starting upscaling image {len(upscale_futures) + 1} via bigger_pics...", level="INFO")
+                upscale_futures.append(upscale_executor.submit(upscale_image, image_bytes, deadline))
+
+            with Camoufox(humanize=True, headless=not args.gui, proxy={"server": "http://localhost:666"}) as camoufox:
+                success, images, deadline = browse(
+                    camoufox,
+                    args.prompt,
+                    args.negative_prompt,
+                    args.shape,
+                    args.style,
+                    None if args.override else styles[0],
+                    int(args.amount),
+                    timeout_seconds,
+                    tmp_path,
+                    select_dropdowns=not args.override,
+                    on_image_ready=start_upscaling if args.upscale else None,
+                )
 
         if success:
             upscaled_amount = 0
-            operation_timed_out = False
+            operation_timed_out = monotonic() >= deadline
+            if operation_timed_out:
+                log_event("Global timeout reached; saving collected images.", level="ERROR")
             current_output_path = ""
             for index, image_bytes in enumerate(images, start=1):
-                try:
-                    remaining_time(deadline)
-                except OperationTimeoutError:
-                    log_event("Global timeout reached before all images were written.", level="ERROR")
-                    operation_timed_out = True
-                    break
-
                 if args.upscale:
-                    log_event(f"Upscaling image {index} via bigger_pics...", level="INFO")
                     try:
-                        image_bytes = upscale_image(image_bytes, deadline)
+                        image_bytes = upscale_futures[index - 1].result()
                         upscaled_amount += 1
                         log_event(f"Image {index} upscaled successfully.", level="SUCCESS")
-                    except TimeoutExpired:
-                        log_event(f"Global timeout reached while upscaling image {index}; stopping.", level="ERROR")
+                    except (OperationTimeoutError, TimeoutExpired):
+                        if not operation_timed_out:
+                            log_event(
+                                f"Global timeout reached while upscaling image {index}; saving original resolution.",
+                                level="ERROR",
+                            )
                         operation_timed_out = True
-                        break
                     except CalledProcessError as e:
                         log_event(f"Upscaling image {index} failed (exit code {e.returncode}): {e.stderr.strip() if e.stderr else 'no stderr'}; using original resolution.", level="ERROR")
                     except Exception as e:
-                        if isinstance(e, OperationTimeoutError):
-                            log_event(f"Global timeout reached while upscaling image {index}; stopping.", level="ERROR")
-                            operation_timed_out = True
-                            break
                         log_event(f"Unexpected error while upscaling image {index}: {e}; using original resolution.", level="ERROR")
 
                 if args.base_64:
-                    try:
-                        remaining_time(deadline)
-                    except OperationTimeoutError:
-                        log_event("Global timeout reached before image output.", level="ERROR")
-                        operation_timed_out = True
-                        break
                     log_event(f"Returning image {index} as Base64 string.", level="SUCCESS")
                     output(b64encode(image_bytes).decode("ascii"), flush=True)
                 else:
                     current_output_path = f"{base_output_dir}_{index}.jpg" if int(args.amount) > 1 else f"{base_output_dir}.jpg"
-                    try:
-                        remaining_time(deadline)
-                    except OperationTimeoutError:
-                        log_event("Global timeout reached before writing the image file.", level="ERROR")
-                        operation_timed_out = True
-                        break
                     with open(current_output_path, "wb") as f:
                         f.write(image_bytes)
-                    try:
-                        remaining_time(deadline)
-                    except OperationTimeoutError:
-                        log_event(f"Global timeout reached while writing image {index}; stopping.", level="ERROR")
-                        operation_timed_out = True
-                        break
 
                     log_event(f"Image {index} saved successfully in", level="SUCCESS", flush=True, end=" ")
                     output(current_output_path, flush=True, end="")
@@ -574,10 +560,6 @@ def run() -> None:
                         except Exception as e:
                             log_event(f"Failed to render image {index} with chafa: {e}", level="ERROR")
 
-            if operation_timed_out:
-                log_event("Global timeout reached before the image batch was fully processed.", level="ERROR")
-                bye(1)
-
             if args.info_file:
                 log_event("Writing info file...", level="INFO")
                 split_output_dir = base_output_dir.rsplit("image", 1)
@@ -586,8 +568,12 @@ def run() -> None:
                     f.write(f"Negative Prompt: {args.negative_prompt}\n")
                     f.write(f"Shape: {args.shape}\n")
                     f.write(f"Style: {args.style}\n")
-                    f.write(f"Amount: {args.amount}\n")
-                    f.write(f"Upscaled: {args.upscale} ({upscaled_amount}/{args.amount})")
+                    f.write(f"Amount: {len(images)}/{args.amount}\n")
+                    f.write(f"Upscaled: {args.upscale} {f'({upscaled_amount}/{args.amount})' if args.upscale else ''}")
+
+            if operation_timed_out:
+                bye(1)
+
             log_event("Finished image generation process; Exiting script.", level="SUCCESS")
             bye(0)
         else:
