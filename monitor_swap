@@ -42,7 +42,7 @@ while true; do
         # Schwellenwert-Filterung
         if [ "$swap_pct" -gt "$THRESHOLD" ]; then
             # Zeitstempel generieren und effizient in Datei schreiben
-            timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            timestamp=$(date --iso-8601=seconds)
             echo "[$timestamp] WARNING: Swap usage is at ${swap_pct}% (Total: ${swap_total}kB, Free: ${swap_free}kB)" >> "$LOG_FILE"
         fi
     fi
