@@ -26,31 +26,23 @@ from time import monotonic, sleep
 from typing import Literal
 
 from colorama import Fore
+from fuzzy_match import match
 
 from fabs_lib import log, normalize_text, now
 
 
 def match_choice(wanted_choice: str, options: list[str]) -> str:
-    """Match a wanted value to the shortest normalized option containing it.
+    """Match a wanted value to the best normalized option using fuzzy matching.
 
     Raises `ValueError` instead of silently guessing when nothing matches.
     """
-    best_length = float("inf")
-    choice = None
+    normalized_options = [normalize_text(option) for option in options]
 
-    normalized_wanted = normalize_text(wanted_choice)
-
-    for option in options:
-        normalized_option = normalize_text(option)
-
-        if normalized_wanted in normalized_option:
-            if len(normalized_option) < best_length:
-                best_length = len(normalized_option)
-                choice = option
+    choice, _score = match.extractOne(normalize_text(wanted_choice), normalized_options, score_cutoff=0.5)
 
     if choice is None:
         raise ValueError(f"{wanted_choice} is not a valid option!")
-    return choice
+    return options[normalized_options.index(choice)]
 
 
 def log_event(msg: object, *, level: Literal["SUCCESS", "INFO", "WARNING", "ERROR"], end: str = "\n", flush: bool = False) -> None:
