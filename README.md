@@ -1,6 +1,6 @@
 # rpi5b-projects
 
-Personal automation and utility scripts, primarily for Linux and Raspberry Pi systems. Each script is independent and may have its own runtime requirements and configuration.
+Personal automation and utility scripts, primarily for Linux and Raspberry Pi (thats where i code them, compatibility not guaranted!) systems. Each script is independent and may have its own runtime requirements and configuration.
 
 <details>
   <summary><b>DISCLAIMER</b></summary>
@@ -43,6 +43,14 @@ Personal automation and utility scripts, primarily for Linux and Raspberry Pi sy
 - `image_api` currently uses a fixed `SCRIPT_PATH` that may need to be changed for your checkout. Running it directly listens on `0.0.0.0:8000` and provides no authentication; do not expose it to an untrusted network.
 - `monitor_swap` runs continuously and writes to `/home/server/swap.log` by default. Review its settings and log permissions before starting it.
 - `update_time` requires root privileges and changes the host timezone and NTP setting.
+
+## Repos
+
+The links to all of my mirrors / repos are:
+
+- https://github.com/Fabsgb/rpi5b-projects (https://github.com/Fabsgb)
+
+- https://codeberg.org/Fabsgb/rpi5b-projects (https://codeberg.org/Fabsgb)
 
 ## Safety
 
