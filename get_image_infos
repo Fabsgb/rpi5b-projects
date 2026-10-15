@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2026  Fabsgb (https://github.com/Fabsgb, https://codeberg.org/Fabsgb)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+import time
+from os import getenv, makedirs, system
+from getpass import getuser
+from argparse import ArgumentParser
+
+from dotenv import load_dotenv
+from camoufox.sync_api import Camoufox
+from colorama import init
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+from fabs_lib_common import log_event
+
+def run(camoufox: Camoufox) -> None:
+    global tmp_path
+
+    target_url = getenv("gen_url")
+    if not target_url:
+        raise RuntimeError("Missing gen_url in .env or environment.")
+
+    browser = camoufox
+    page = browser.new_page()
+
+    log_event("Loading site...", level="INFO")
+    page.goto(target_url)
+    log_event("Site loaded successfully.", level="SUCCESS")
+
+    preferences_link = page.locator("#changePreferencesLinkEl")
+    log_event("Checking for preferences dialog...", level="INFO")
+    try:
+        preferences_link.wait_for(state="visible", timeout=2_000)
+    except PlaywrightTimeoutError:
+        log_event("Preferences dialog not found; continuing.", level="INFO")
+    else:
+        try:
+            log_event("Opening preferences dialog...", level="INFO")
+            preferences_link.click(timeout=10_000)
+        except PlaywrightTimeoutError:
+            log_event("Button click failed for the preferences dialog; trying JS fallback.", level="WARNING")
+            preferences_link.evaluate("element => element.click()")
+
+        visibility = page.locator("#sensitiveContentVisibilityEl")
+        try:
+            log_event("Setting sensitive-content visibility to warn...", level="INFO")
+            selected_values = visibility.select_option("warn", timeout=10_000)
+        except PlaywrightTimeoutError:
+            log_event("select_option() timed out; using JS fallback.", level="WARNING")
+            selected_value = visibility.evaluate(
+                """element => {
+                    element.value = "warn";
+                    element.dispatchEvent(new Event("input", { bubbles: true }));
+                    element.dispatchEvent(new Event("change", { bubbles: true }));
+                    return element.value;
+                }"""
+            )
+            if selected_value != "warn":
+                raise RuntimeError(
+                    "Could not set sensitive-content visibility to warn."
+                )
+            log_event("Sensitive-content visibility set via JS fallback.", level="SUCCESS")
+        else:
+            if selected_values != ["warn"]:
+                raise RuntimeError(
+                    "Could not set sensitive-content visibility to warn."
+                )
+            log_event("Sensitive-content visibility set to warn.", level="SUCCESS")
+
+        age_verification_label = page.locator(
+            'label[for="ageVerificationCheckboxEl"]'
+        )
+        try:
+            log_event("Checking age verification...", level="INFO")
+            age_verification_label.click(timeout=10_000)
+        except PlaywrightTimeoutError:
+            log_event("Age verification checkbox click failed; checking via form control fallback.", level="WARNING")
+            page.locator("#ageVerificationCheckboxEl").check(timeout=10_000)
+
+        save_preferences = page.locator('button[onclick*="savePreferences"]')
+        try:
+            log_event("Saving preferences...", level="INFO")
+            save_preferences.click(timeout=10_000)
+        except PlaywrightTimeoutError:
+            log_event("Save button click failed; trying JS fallback.", level="WARNING")
+            save_preferences.evaluate("element => element.click()")
+
+    show_content = page.locator("#showContentBtn")
+    log_event("Showing content...", level="INFO")
+    try:
+        show_content.wait_for(state="visible", timeout=2_000)
+    except PlaywrightTimeoutError:
+        log_event("Content button not found; continuing.", level="INFO")
+    else:
+        try:
+            show_content.click(timeout=10_000)
+        except PlaywrightTimeoutError:
+            log_event("showContent button click failed; using JS fallback.", level="WARNING")
+            show_content.evaluate("element => element.click()")
+
+    frame = page.frame_locator("#outputIframeEl")
+    style = frame.locator("select[data-name='artStyle']")
+    shape = frame.locator("select[data-name='shape']")
+    numbers = frame.locator("select[data-name='numImages']")
+
+    def get_info(option, name) -> None:
+        log_event(f"Reading available {name} values...", level="INFO")
+        option.wait_for()
+
+        for _ in range(50):
+            count = option.locator("option").count()
+            if count > 1:
+                break
+            time.sleep(0.2)
+        else:
+            raise TimeoutError(f"{option}-Optionen wurden nicht rechtzeitig geladen")
+
+        options = option.locator("option").evaluate_all(
+            "elements => elements.map(e => e.text)"
+        )
+        log_event(f"Found {len(options)} available {name} values.", level="INFO")
+
+        output_path = f"{tmp_path}/{name}.txt"
+        with open(output_path, "w") as f:
+            f.write(str(options))
+        log_event(f"Saved {name} values to {output_path}.", level="SUCCESS")
+
+    get_info(style, "styles")
+    get_info(shape, "shapes")
+    get_info(numbers, "numbers")
+
+    log_event("Finished fetching image metadata; exiting script.", level="SUCCESS")
+
+
+if __name__ == "__main__":
+    init()
+    log_event("Initializing script...", level="INFO")
+    load_dotenv()
+
+    tmp_path = "/tmp/image_" + getuser()
+    makedirs(tmp_path, exist_ok=True)
+    system(f"chmod 2700 {tmp_path}")
+
+    argument_parser = ArgumentParser(description="Get the available styles, shapes, and numbers from the image generator.")
+    argument_parser.add_argument("--gui", action="store_true", help="Run the script with a GUI (not headless).")
+    args = argument_parser.parse_args()
+
+    try:
+        with Camoufox(humanize=True, headless=not args.gui, proxy={"server": "http://localhost:666"}) as camoufox:
+            run(camoufox)
+    except KeyboardInterrupt:
+        log_event("Script interrupted by user; Exiting.", level="ERROR")
+    except Exception as exc:
+        log_event(f"Image info collection failed: {exc}", level="ERROR")
+        raise

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-""""Upscale any givin picture which is below the size of 2048px, using the bigger.pics webiste (Free compute tastes yummy)"""
+""""Upscale any givin picture which is below the size of 2048px, using the upscale_url website"""
 #
 # Copyright (C) 2026  Fabsgb (https://github.com/Fabsgb, https://codeberg.org/Fabsgb)
 #
@@ -22,10 +22,12 @@ from sys import exit as bye, stdin
 from argparse import ArgumentParser
 from urllib import request
 from base64 import b64decode, b64encode
-from os import makedirs, path
+from os import getenv, makedirs, path
 
 from colorama import init
 from camoufox.sync_api import Camoufox
+from dotenv import load_dotenv
+
 from fabs_lib import log, output, tmp_path
 from fabs_lib_common import log_event
 from fabs_lib_playwright import get_content_frame
@@ -54,8 +56,8 @@ def browse(camoufox: Camoufox, image: bytes) -> tuple[bool, bytes | None]:
         log_event(f"VPN IP Address: {ip_addr}", level="INFO")
 
         #-----Switching sites-----#
-        log_event("Navigating to bigger.pics", level="INFO")
-        page.goto("https://bigger.pics")
+        log_event("Navigating to the wanted website", level="INFO")
+        page.goto(getenv("upscale_url"))
 
         #-----Uploading picture-----#
         log_event("Uploading the picture", level="INFO")
@@ -81,6 +83,8 @@ def browse(camoufox: Camoufox, image: bytes) -> tuple[bool, bytes | None]:
 
 
 def run() -> None:
+    load_dotenv()
+
     parser = ArgumentParser()
     parser.add_argument("-i", "--image", type=str, help="The image to upscale (Base64 or Path). If omitted, read Base64 from stdin.")
     parser.add_argument("--gui", action="store_true", help="If the browser should be started with a gui")
@@ -112,7 +116,7 @@ def run() -> None:
             output(b64encode(data[1]).decode("ascii"))
         else:
             if args.output_dir is None:
-                image_path = path.join(tmp_path("bigger_pics"), "image.jpg")
+                image_path = path.join(tmp_path("upscale_pics"), "image.jpg")
             else:
                 if args.output_dir.endswith(".jpg"):
                     image_path = args.output_dir

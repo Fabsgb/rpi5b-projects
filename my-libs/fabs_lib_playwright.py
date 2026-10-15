@@ -23,6 +23,7 @@ from time import sleep
 
 from playwright.sync_api import Frame, Locator
 
+
 def get_content_frame(locator: Locator) -> Frame:
     """Resolve an `<iframe>` locator to the Playwright `Frame` inside it.
 

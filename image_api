@@ -25,7 +25,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 app = FastAPI()
 
 # Make sure this points to your actual script
-SCRIPT_PATH = Path(__file__).parent / "perchance_image_generator"
+SCRIPT_PATH = Path(__file__).parent / "image_generator"
 
 MIN_AMOUNT = 1
 MAX_AMOUNT = 60
