@@ -24,7 +24,7 @@ Personal automation and utility scripts, primarily for Linux and Raspberry Pi (t
 | Path | Purpose |
 | --- | --- |
 | [`auto_report_f2b_email`](auto_report_f2b_email) | Looks up IP registration data and runs an email-report workflow for an IP address and log excerpt. |
-| [`upscale_image`](upscale_image) | Upscales an image using browser automation. |
+| [`upscale_image`](upscale_image) | Upscales an image using browser automation, with configurable proxy, timeout, and terminal preview options. |
 | [`crawl`](crawl) | Crawls a site, parses sitemaps, and can generate an HTML report with keyword or Ollama-assisted analysis. |
 | [`get_image_infos`](get_image_infos) | Reads available image-generation styles, shapes, and image counts. |
 | [`image_api`](image_api) | FastAPI endpoint that runs the image generator and returns generated image data. |

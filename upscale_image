@@ -18,8 +18,11 @@
 #
 from __future__ import annotations
 
+from argparse import ArgumentParser, ArgumentTypeError
+from math import isfinite
 from sys import exit as bye, stdin
-from argparse import ArgumentParser
+from subprocess import run as subprocess_run
+from time import monotonic
 from urllib import request
 from base64 import b64decode, b64encode
 from os import getenv, makedirs, path
@@ -29,12 +32,38 @@ from camoufox.sync_api import Camoufox
 from dotenv import load_dotenv
 
 from fabs_lib import log, output, tmp_path
-from fabs_lib_common import log_event
+from fabs_lib_common import log_event, timed_input
 from fabs_lib_playwright import get_content_frame
 
 
-def browse(camoufox: Camoufox, image: bytes) -> tuple[bool, bytes | None]:
+def parse_proxy(value: str) -> str | bool:
+    if value.casefold() == "false":
+        return False
+    return value
+
+
+def browse(
+    camoufox: Camoufox,
+    image: bytes,
+    *,
+    timeout: float | None,
+    proxy_warning: bool,
+) -> tuple[bool, bytes | None]:
     raw = None
+    deadline = monotonic() + timeout if timeout is not None else None
+
+    def remaining_time() -> float:
+        if deadline is None:
+            raise RuntimeError("No timeout deadline was set.")
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("The operation exceeded --timeout.")
+        return remaining
+
+    def remaining_timeout_ms() -> int | None:
+        if deadline is None:
+            return None
+        return max(1, int(remaining_time() * 1000))
 
     try:
         log_event("Starting the browser...", level="INFO")
@@ -42,31 +71,65 @@ def browse(camoufox: Camoufox, image: bytes) -> tuple[bool, bytes | None]:
         context = browser.new_context(viewport={"width": 1920, "height": 1080})
         page = context.new_page()
 
+        def refresh_default_timeout() -> None:
+            default_timeout = remaining_timeout_ms()
+            if default_timeout is not None:
+                page.set_default_timeout(default_timeout)
+
         #-----IP address check-----#
-        log_event("Checking for IP address errors", level="INFO")
-        page.goto("http://api.ipify.org")
-        ip_addr = page.locator('pre').inner_text()
-        if ip_addr == request.urlopen('http://api.ipify.org').read().decode('utf-8'):
-            log_event(f"IP Address '{ip_addr}' is the ip address of your host and is being used as the ip addres of the browser, something might be wrong with the proxy configuration, please check!", level="WARNING")
-            if input("Should the upscaling be continued (y/N)? ").casefold() != "y":
-                browser.close()
-                return False, raw
-            else:
+        if proxy_warning:
+            log_event("Checking for IP address errors", level="INFO")
+            ip_timeout = remaining_timeout_ms()
+            page.goto(
+                "http://api.ipify.org",
+                **({"timeout": ip_timeout} if ip_timeout is not None else {}),
+            )
+            refresh_default_timeout()
+            ip_addr = page.locator('pre').inner_text()
+            request_timeout = remaining_time() if deadline is not None else None
+            with request.urlopen(
+                "http://api.ipify.org",
+                **({"timeout": request_timeout} if request_timeout is not None else {}),
+            ) as response:
+                host_ip = response.read().decode("utf-8")
+            if ip_addr == host_ip:
+                log_event(f"IP Address '{ip_addr}' is the ip address of your host and is being used as the ip addres of the browser, something might be wrong with the proxy configuration, please check!", level="WARNING")
+                prompt = "Should the upscaling be continued (y/N)? "
+                if deadline is None:
+                    continue_upscaling = input(prompt).casefold() == "y"
+                else:
+                    continue_upscaling = (
+                        timed_input(prompt, timeout=min(30, remaining_time())) or ""
+                    ).casefold() == "y"
+                if not continue_upscaling:
+                    browser.close()
+                    return False, raw
                 log_event("Continuing generation...", level="INFO")
-        log_event(f"VPN IP Address: {ip_addr}", level="INFO")
+            log_event(f"VPN IP Address: {ip_addr}", level="INFO")
 
         #-----Switching sites-----#
         log_event("Navigating to the wanted website", level="INFO")
-        page.goto(getenv("upscale_url"))
+        navigation_timeout = remaining_timeout_ms()
+        page.goto(
+            getenv("upscale_url"),
+            **({"timeout": navigation_timeout} if navigation_timeout is not None else {}),
+        )
 
         #-----Uploading picture-----#
         log_event("Uploading the picture", level="INFO")
+        refresh_default_timeout()
         iframe = get_content_frame(page.locator("#app"))
+        refresh_default_timeout()
         iframe.locator("#file").set_input_files({"name": f"image.jpg", "mimeType": "image/jpeg", "buffer": image})
 
         #-----Download file-----#
-        with page.expect_download() as download_info:
-            iframe.locator("a[class='button downloadMain']").click(timeout=60000)
+        download_timeout = remaining_timeout_ms()
+        if download_timeout is None:
+            download_timeout = 60000
+        with page.expect_download(timeout=download_timeout) as download_info:
+            iframe.locator("a[class='button downloadMain']").click(
+                timeout=min(60000, download_timeout)
+            )
 
         download = download_info.value
         file_path = download.path()
@@ -88,11 +151,24 @@ def run() -> None:
     parser = ArgumentParser()
     parser.add_argument("-i", "--image", type=str, help="The image to upscale (Base64 or Path). If omitted, read Base64 from stdin.")
     parser.add_argument("--gui", action="store_true", help="If the browser should be started with a gui")
+    parser.add_argument("-pr", "--proxy", type=parse_proxy, metavar="URL|false", default="http://localhost:666", help="Proxy server to use for the browser. Use 'false' to disable the proxy.")
+    parser.add_argument("-pw", "--disable-proxy-warning", action="store_true", help="Disable the warning for a not working proxy configuration.")
+    parser.add_argument("-t", "--timeout", type=float, default=None, help="Maximum time in seconds for the proxy check, browser navigation, upload, and download.")
+    parser.add_argument("-v", "--preview", action="store_true", help="Display the upscaled image in the terminal using chafa.")
 
     output_type = parser.add_mutually_exclusive_group()
     output_type.add_argument("-o", "--output-dir", type=str, help="Where the final image should be saved, if not specified the name of the image file will be image.jpg. The standard path is within /tmp so the image will not be saved accros reboots.")
     output_type.add_argument("-b64", "--base64", action="store_true", help="Return the image as base64 instead of saving it to a path")
     args = parser.parse_args()
+
+    if args.timeout is not None and (not isfinite(args.timeout) or args.timeout <= 0):
+        parser.error("--timeout must be a positive finite number.")
+
+    if args.preview and args.base64:
+        log_event("Displaying the image will use chafa which uses stdout, this may corrupt the output if automatic systems try to read it.", level="WARNING")
+        if (timed_input("Do you want to continue (y/N)? ", timeout=30) or "").casefold() not in {"y", "yes"}:
+            log_event("Exiting script due to user choice.", level="INFO")
+            bye(0)
 
     image_input = args.image if args.image is not None else stdin.read().strip()
     if not image_input:
@@ -109,8 +185,17 @@ def run() -> None:
             log_event(f"the image input is neither a path nor a valid base64!", level="ERROR")
             bye(1)
 
-    with Camoufox(humanize=True, headless=not args.gui, proxy={"server": "http://localhost:666"}) as browser:
-        data = browse(camoufox=browser, image=image_bytes)
+    with Camoufox(
+        humanize=True,
+        headless=not args.gui,
+        proxy={"server": args.proxy} if args.proxy else None,
+    ) as browser:
+        data = browse(
+            camoufox=browser,
+            image=image_bytes,
+            timeout=args.timeout,
+            proxy_warning=bool(args.proxy) and not args.disable_proxy_warning,
+        )
     if data[0]:
         if args.base64:
             output(b64encode(data[1]).decode("ascii"))
@@ -128,6 +213,11 @@ def run() -> None:
             log_event(f"Image saved in", end=" ", flush=True, level="SUCCESS")
             output(image_path, end="", flush=True)
             log(" !", flush=True)
+        if args.preview:
+            try:
+                subprocess_run(["chafa", "-"], input=data[1], check=True)
+            except Exception as e:
+                log_event(f"Failed to render the image with chafa: {e}", level="ERROR")
         bye(0)
     else:
         bye(1)

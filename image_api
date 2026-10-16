@@ -56,7 +56,9 @@ def generate(
         "--prompt", prompt,
         "--base-64",
         "--amount", str(amount),
-        "-u"
+        "--upscale",
+        "--i-know-what-i-am-doing"
+
     ]
     if negative_prompt:
         cmd.extend(["--negative-prompt", negative_prompt])

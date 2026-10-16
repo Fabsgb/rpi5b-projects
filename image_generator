@@ -57,7 +57,6 @@ from fabs_lib_common import log_event, match_choice, timed_input
 from fabs_lib_playwright import get_content_frame, human_typing
 
 
-
 def unix_sec() -> str:
     return dt.now().astimezone().strftime('%s')
 
@@ -170,6 +169,7 @@ def browse(
     select_dropdowns: bool,
     on_image_ready: Callable[[bytes, float], None] | None = None,
     save_error_screenshots: bool = True,
+    proxy_warning: bool = True
 ) -> tuple[bool, list[bytes], float]:
     """Generate images and return their raw bytes.
 
@@ -200,17 +200,18 @@ def browse(
         if not target_url:
             raise RuntimeError("Missing gen_url in .env or environment.")
 
-        page.goto("http://api.ipify.org", timeout=remaining_timeout_ms(deadline))
-        remaining_time(deadline)
-        ip_addr = page.locator('pre').inner_text()
-        log_event(f"VPN IP Address: {ip_addr}", level="INFO")
-        if ip_addr == request.urlopen('http://api.ipify.org', timeout=remaining_time(deadline)).read().decode('utf-8'):
-            record_error()
-            log_event(f"IP Address '{ip_addr}' is the ip address of your host, something might be wrong with the proxy configuration, please check!", level="ERROR")
-            if (timed_input("Should the generation be continued (y/N)? ", timeout=min(30, remaining_time(deadline))) or "").casefold() not in {"yes", "YES", "Yes", "y"}:
-                return False, images, deadline
-            else:
-                log_event("Continuing generation...", level="INFO")
+        if proxy_warning:
+            page.goto("http://api.ipify.org", timeout=remaining_timeout_ms(deadline))
+            remaining_time(deadline)
+            ip_addr = page.locator('pre').inner_text()
+            log_event(f"VPN IP Address: {ip_addr}", level="INFO")
+            if ip_addr == request.urlopen('http://api.ipify.org', timeout=remaining_time(deadline)).read().decode('utf-8'):
+                record_error()
+                log_event(f"IP Address '{ip_addr}' is the ip address of your host, something might be wrong with the proxy configuration, please check!", level="ERROR")
+                if (timed_input("Should the generation be continued (y/N)? ", timeout=min(30, remaining_time(deadline))) or "").casefold() not in {"yes", "YES", "Yes", "y"}:
+                    return False, images, deadline
+                else:
+                    log_event("Continuing generation...", level="INFO")
 
         #-----Switching sites-----#
         page.goto(target_url, timeout=remaining_timeout_ms(deadline))
@@ -374,7 +375,7 @@ def browse(
             log_event(f"Error while filling in negative prompt: {e}", level="ERROR")
             log_event("Skipping negative prompt.", level="INFO")
 
-        if select_dropdowns and shape is not None and shape != "portrait(512x768px)":
+        if select_dropdowns and shape is not None and shape != default_shape:
             try:
                 log_event(f"Selecting shape: {shape}", level="INFO")
                 close_announcement_if_open()
@@ -627,7 +628,7 @@ def run() -> None:
         parser.add_argument("-st", "--style", type=str if pre_args.override else partial(get_choice, options=styles), default=None if pre_args.override else (styles[0] if styles else None), help="The style of the image to generate.")
         parser.add_argument("-n", "--amount", type=int if pre_args.override else partial(match_number, numbers=numbers), default=1 if pre_args.override else (numbers[0] if numbers else "1"), help="The amount of images to generate.")
         parser.add_argument("-t", "--timeout", type=str, default="60 + n * 60 + n * u * 30", help="Maximum total time, in seconds, from browse() starting through generation, optional upscaling, and writing the image files. Can be a plain number or an expression in terms of `n` (image count) and `u` (1 when upscaling, otherwise 0).")
-        parser.add_argument("--upscale-timeout", type=float, default=30.0, help="Maximum time in seconds for each image's upscale attempt; on timeout, save that image at its original resolution and continue with the next image.")
+        parser.add_argument("--upscale-timeout", type=float, default=None, help="Maximum time in seconds for each image's upscale attempt; on timeout, save that image at its original resolution and continue with the next image.")
         parser.add_argument("--gui", action="store_true", help="Run the script with a visible browser window (for debugging, do not use for production).")
         parser.add_argument("-l", "--list", action="store_true", help="List all available styles, shapes, and amounts, then exit.")
         parser.add_argument("-u", "--upscale", action="store_true", help="Send the image to bigger.pics and upscale it so that it longest side is 2048px.")
@@ -636,14 +637,20 @@ def run() -> None:
         parser.add_argument("-o", "--override", action="store_true", help="Skip loading dynamic options and leave the shape, style, and amount dropdowns unchanged.")
         parser.add_argument("--i-know-what-i-am-doing", action="store_true", help="Bypass the warning about sensitive / mature content which might not be suitable for all audiences. Use this only if you understand the risks.")
         parser.add_argument("-pr", "--proxy", type=parse_proxy, metavar="URL|false", default="http://localhost:666", help="Proxy server to use for the browser. Can be a URL (e.g., http://localhost:666), or 'false' to disable the proxy, if not set it will use the default http://localhost:666.")
+        parser.add_argument("-ur", "--upscale-retry", type=int, default=2, help="Number of times to retry upscaling an image if an attempt fails.")
+        parser.add_argument("-pw", "--disable-proxy-warning", action="store_true", help="Disable the warning for a not working proxy configuration.")
 
         output_type = parser.add_mutually_exclusive_group()
         output_type.add_argument("-d", "--output-dir", type=str, help="Where the final image should be saved, if not specified the name of the image file will be image.jpg. The standard path is within /tmp so the image will not be saved across reboots.")
         output_type.add_argument("-b64", "--base-64", action="store_true", dest="base_64", help="Pass the final image as Base64 instead of saving it to a path.")
         args = parser.parse_args()
 
-        if args.upscale_timeout and not args.upscale:
+        if args.upscale_timeout is not None and not args.upscale:
             parser.error("--upscale-timeout is only supported if the images are being upscaled with --upscale.")
+        if args.upscale_timeout is None:
+            args.upscale_timeout = 30.0
+        if args.upscale_retry < 0:
+            parser.error("--upscale-retry must be zero or a positive integer.")
 
         if not args.override:
             if not styles or not shapes or not numbers:
@@ -736,17 +743,38 @@ def run() -> None:
                         log_event(f"Failed to render image {image_number} with chafa: {e}", level="ERROR")
 
         with ThreadPoolExecutor(max_workers=1) as upscale_executor:
+            def upscale_with_retries(image_bytes: bytes, image_number: int, deadline: float) -> bytes:
+                total_attempts = args.upscale_retry + 1
+                for attempt in range(1, total_attempts + 1):
+                    try:
+                        return upscale_image(
+                            image_bytes,
+                            gui=args.gui,
+                            deadline=deadline,
+                            upscale_timeout=args.upscale_timeout,
+                        )
+                    except OperationTimeoutError:
+                        raise
+                    except Exception as e:
+                        if attempt == total_attempts:
+                            raise
+                        log_event(
+                            f"Upscaling image {image_number} failed on attempt "
+                            f"{attempt}/{total_attempts}: {e}; retrying.",
+                            level="WARNING",
+                        )
+                raise RuntimeError("Upscaling attempts ended without a result.")
+
             def start_upscaling(image_bytes: bytes, deadline: float) -> None:
                 nonlocal upscale_count
                 upscale_count += 1
                 image_number = upscale_count
                 log_event(f"Starting upscaling image {image_number} via bigger_pics...", level="INFO")
                 future = upscale_executor.submit(
-                    upscale_image,
+                    upscale_with_retries,
                     image_bytes,
-                    gui=args.gui,
+                    image_number,
                     deadline=deadline,
-                    upscale_timeout=args.upscale_timeout,
                 )
 
                 def finish_upscaling(completed: Future[bytes]) -> None:
@@ -796,7 +824,7 @@ def run() -> None:
                     select_dropdowns=not args.override,
                     on_image_ready=(lambda image_bytes, deadline: start_upscaling(image_bytes, deadline)) if args.upscale else None,
                     save_error_screenshots=not args.base_64,
-                    
+                    proxy_warning=bool(args.proxy) and not args.disable_proxy_warning,
                 )
 
         if success:
