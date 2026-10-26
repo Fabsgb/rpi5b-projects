@@ -45,6 +45,7 @@ from urllib import request
 from random import uniform
 from os import getenv
 from dotenv import load_dotenv
+from pathlib import Path
 
 from camoufox import DefaultAddons
 from camoufox.sync_api import Camoufox
@@ -130,7 +131,7 @@ def upscale_image(
     the per-image timeout expires, or OperationTimeoutError if the global
     deadline expires.
     """
-    command = ["/home/server/scripts/upscale_image", "-b64"]
+    command = [path.join(Path(__file__).parent, "upscale_image"), "-b64"]
     if gui:
         command.append("--gui")
     global_remaining = remaining_time(deadline)
@@ -200,6 +201,7 @@ def browse(
         if not target_url:
             raise RuntimeError("Missing gen_url in .env or environment.")
 
+	#-----Check if the proxy has been configured correctly-----#
         if proxy_warning:
             page.goto("http://api.ipify.org", timeout=remaining_timeout_ms(deadline))
             remaining_time(deadline)
@@ -310,6 +312,7 @@ def browse(
             if not announcement_dialog.is_visible():
                 return
             try:
+                sleep(1 + uniform(0.5, 1))
                 announcement_dialog.locator(
                     "button, .close, [aria-label='Close']"
                 ).first.click(
