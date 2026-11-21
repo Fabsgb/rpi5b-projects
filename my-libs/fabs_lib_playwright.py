@@ -19,9 +19,101 @@
 from __future__ import annotations
 
 from random import uniform
-from time import sleep
+from time import monotonic, sleep
+from typing import Callable, Literal
+from urllib import request
 
-from playwright.sync_api import Frame, Locator
+from camoufox.sync_api import Camoufox
+from playwright.sync_api import Frame, Locator, Page
+
+from fabs_lib_common import log_event, timed_input
+
+
+class OperationTimeoutError(TimeoutError):
+    """Raised when an operation exceeds its shared deadline."""
+
+
+def remaining_time(deadline: float | None) -> float | None:
+    """Return seconds remaining, raising when a supplied deadline has expired."""
+    if deadline is None:
+        return None
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise OperationTimeoutError("Global timeout reached.")
+    return remaining
+
+
+def remaining_timeout_ms(
+    deadline: float | None,
+    *,
+    maximum: int | None = None,
+) -> int | None:
+    """Return the remaining deadline as milliseconds, optionally capped."""
+    remaining = remaining_time(deadline)
+    if remaining is None:
+        return maximum
+    timeout = max(1, int(remaining * 1000))
+    return min(timeout, maximum) if maximum is not None else timeout
+
+
+def start_browser(
+    *,
+    headless: bool,
+    proxy: str | bool | None = "http://localhost:666",
+) -> Camoufox:
+    """Create the standard humanized Camoufox browser context manager."""
+    return Camoufox(
+        humanize=True,
+        headless=headless,
+        proxy={"server": proxy} if isinstance(proxy, str) else None,
+    )
+
+
+def proxy_check(
+    page: Page,
+    *,
+    deadline: float | None,
+    on_error: Callable[[], None] | None = None,
+    prompt: str = "Should the generation be continued (y/N)? ",
+    warning_level: Literal["WARNING", "ERROR"] = "ERROR",
+) -> bool:
+    """Check that browser traffic uses the proxy and ask before continuing otherwise."""
+    page_timeout = remaining_timeout_ms(deadline)
+    page.goto(
+        "http://api.ipify.org",
+        **({"timeout": page_timeout} if page_timeout is not None else {}),
+    )
+    remaining_time(deadline)
+    content_timeout = remaining_timeout_ms(deadline)
+    ip_addr = page.locator("pre").inner_text(
+        **({"timeout": content_timeout} if content_timeout is not None else {})
+    )
+    log_event(f"VPN IP Address: {ip_addr}", level="INFO")
+    request_timeout = remaining_time(deadline)
+    with request.urlopen(
+        "http://api.ipify.org",
+        **({"timeout": request_timeout} if request_timeout is not None else {}),
+    ) as response:
+        host_ip = response.read().decode("utf-8")
+    if ip_addr == host_ip:
+        if on_error is not None:
+            on_error()
+        log_event(
+            f"IP Address '{ip_addr}' is the ip address of your host, something "
+            "might be wrong with the proxy configuration, please check!",
+            level=warning_level,
+        )
+        if deadline is None:
+            answer = input(prompt)
+        else:
+            answer = timed_input(
+                prompt,
+                timeout=min(30, remaining_time(deadline)),
+            ) or ""
+        if answer.casefold() not in {"yes", "y"}:
+            return False
+        log_event("Continuing generation...", level="INFO")
+    return True
 
 
 def get_content_frame(locator: Locator) -> Frame:

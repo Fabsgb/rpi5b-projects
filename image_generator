@@ -41,20 +41,27 @@ from subprocess import run as subprocess_run, CalledProcessError, TimeoutExpired
 from sys import exit as bye
 from time import monotonic, sleep
 from typing import Callable
-from urllib import request
 from random import uniform
 from dotenv import load_dotenv
 from pathlib import Path
 
 from camoufox import DefaultAddons
-from camoufox.sync_api import Camoufox
 from colorama import init
 from playwright.sync_api import Browser, BrowserContext, TimeoutError as PlaywrightTimeoutError
 from sympy import Symbol, sympify
 
 from fabs_lib import log, output
 from fabs_lib_common import log_event, match_choice, timed_input
-from fabs_lib_playwright import get_content_frame, human_typing
+from fabs_lib_playwright import (
+    OperationTimeoutError,
+    get_content_frame,
+    human_typing,
+    proxy_check,
+    remaining_time,
+    remaining_timeout_ms,
+    start_browser,
+)
+from fabs_lib_image_gemeration import prepare_image_site
 
 
 def unix_sec() -> str:
@@ -82,21 +89,6 @@ def get_choice(wanted_choice: str, options: list[str]) -> str:
         return match_choice(wanted_choice, options)
     except ValueError:
         return options[0]
-
-
-class OperationTimeoutError(TimeoutError):
-    """Raised when the generation-wide deadline expires."""
-
-
-def remaining_time(deadline: float) -> float:
-    remaining = deadline - monotonic()
-    if remaining <= 0:
-        raise OperationTimeoutError("Global timeout reached.")
-    return remaining
-
-
-def remaining_timeout_ms(deadline: float) -> int:
-    return max(1, int(remaining_time(deadline) * 1000))
 
 
 def raise_walk_error(error: OSError) -> None:
@@ -200,103 +192,18 @@ def browse(
         if not target_url:
             raise RuntimeError("Missing gen_url in .env or environment.")
 
-	#-----Check if the proxy has been configured correctly-----#
-        if proxy_warning:
-            page.goto("http://api.ipify.org", timeout=remaining_timeout_ms(deadline))
-            remaining_time(deadline)
-            ip_addr = page.locator('pre').inner_text()
-            log_event(f"VPN IP Address: {ip_addr}", level="INFO")
-            if ip_addr == request.urlopen('http://api.ipify.org', timeout=remaining_time(deadline)).read().decode('utf-8'):
-                record_error()
-                log_event(f"IP Address '{ip_addr}' is the ip address of your host, something might be wrong with the proxy configuration, please check!", level="ERROR")
-                if (timed_input("Should the generation be continued (y/N)? ", timeout=min(30, remaining_time(deadline))) or "").casefold() not in {"yes", "YES", "Yes", "y"}:
-                    return False, images, deadline
-                else:
-                    log_event("Continuing generation...", level="INFO")
+        if proxy_warning and not proxy_check(
+            page,
+            deadline=deadline,
+            on_error=record_error,
+        ):
+            return False, images, deadline
 
         #-----Switching sites-----#
         page.goto(target_url, timeout=remaining_timeout_ms(deadline))
 
         #-----Passing age verification-----#
-        preferences_link = page.locator("#changePreferencesLinkEl")
-        try:
-            preferences_link.wait_for(
-                state="visible",
-                timeout=min(remaining_timeout_ms(deadline), 2_000),
-            )
-        except PlaywrightTimeoutError:
-            pass
-        else:
-            try:
-                preferences_link.click(timeout=remaining_timeout_ms(deadline))
-            except PlaywrightTimeoutError:
-                preferences_link.evaluate(
-                    "element => element.click()",
-                    timeout=remaining_timeout_ms(deadline),
-                )
-
-            visibility = page.locator("#sensitiveContentVisibilityEl")
-            try:
-                visibility.click()
-                selected_values = visibility.select_option(
-                    "warn",
-                    timeout=remaining_timeout_ms(deadline),
-                )
-            except PlaywrightTimeoutError:
-                selected_value = visibility.evaluate(
-                    """element => {
-                        element.value = "warn";
-                        element.dispatchEvent(new Event("input", { bubbles: true }));
-                        element.dispatchEvent(new Event("change", { bubbles: true }));
-                        return element.value;
-                    }""",
-                    timeout=remaining_timeout_ms(deadline),
-                )
-                if selected_value != "warn":
-                    raise RuntimeError(
-                        "Could not set sensitive-content visibility to warn."
-                    )
-            else:
-                if selected_values != ["warn"]:
-                    raise RuntimeError(
-                        "Could not set sensitive-content visibility to warn."
-                    )
-
-            age_verification_label = page.locator(
-                'label[for="ageVerificationCheckboxEl"]'
-            )
-            try:
-                age_verification_label.click(timeout=remaining_timeout_ms(deadline))
-            except PlaywrightTimeoutError:
-                page.locator("#ageVerificationCheckboxEl").check(
-                    timeout=remaining_timeout_ms(deadline)
-                )
-
-            save_preferences = page.locator('button[onclick*="savePreferences"]')
-            try:
-                save_preferences.click(timeout=remaining_timeout_ms(deadline))
-            except PlaywrightTimeoutError:
-                save_preferences.evaluate(
-                    "element => element.click()",
-                    timeout=remaining_timeout_ms(deadline),
-                )
-
-        show_content = page.locator("#showContentBtn")
-        try:
-            show_content.wait_for(
-                state="visible",
-                timeout=min(remaining_timeout_ms(deadline), 2_000),
-            )
-        except PlaywrightTimeoutError:
-            pass
-        else:
-            try:
-                show_content.click(timeout=remaining_timeout_ms(deadline))
-            except PlaywrightTimeoutError:
-                show_content.evaluate(
-                    "element => element.click()",
-                    timeout=remaining_timeout_ms(deadline),
-                )
+        prepare_image_site(page, deadline=deadline)
         log_event("Loading site...", level="INFO")
 
         #-----Finding the image generator-----#
@@ -811,7 +718,10 @@ def run() -> None:
                 future.add_done_callback(finish_upscaling)
                 
             log_event("Starting Browser...", level="INFO")
-            with Camoufox(humanize=True, headless=not args.gui, proxy={"server": args.proxy} if args.proxy else None) as camoufox:
+            with start_browser(
+                headless=not args.gui,
+                proxy=args.proxy,
+            ) as camoufox:
                 success, images, deadline = browse(
                     camoufox,
                     prompt=args.prompt,

@@ -16,6 +16,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 import argparse
+from ipaddress import ip_address
 from requests import get, RequestException
 from smtplib import SMTP
 from email.message import EmailMessage
@@ -25,7 +26,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 parser = argparse.ArgumentParser()
-parser.add_argument("ip_addr", help="Set the ip address of the bad actor which should be reportet.")
+parser.add_argument(
+    "ip_addr",
+    type=ip_address,
+    help="Set the IP address to report.",
+)
 parser.add_argument("log", help="The log snipsets which prove the malicues actions of the ip")
 args = parser.parse_args()
 
@@ -69,6 +74,7 @@ if abuse_email:
     print(f"Found Abuse Email: {abuse_email}")
 else:
     print("No abuse email could be found.")
+    raise SystemExit(1)
 
 email_template = f"""The IP address {args.ip_addr} has conducted malicious actions, and this email address ({abuse_email}) is listed as the corresponding abuse contact on rdap.org.
 

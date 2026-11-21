@@ -17,19 +17,28 @@
 #
 
 # KONFIGURATION
-THRESHOLD=50                  # Schwellenwert in Prozent
-LOG_FILE="/home/server/swap.log" # Pfad zur Logdatei
-SLEEP_TIME=10                 # Intervall in Sekunden
+THRESHOLD="${THRESHOLD:-50}"                      # Schwellenwert in Prozent
+LOG_FILE="${LOG_FILE:-/home/server/swap.log}"     # Pfad zur Logdatei
+SLEEP_TIME="${SLEEP_TIME:-10}"                    # Intervall in Sekunden
+MEMINFO_FILE="${MEMINFO_FILE:-/proc/meminfo}"
+MAX_CHECKS="${MAX_CHECKS:-0}"
+
+if [[ ! "$MAX_CHECKS" =~ ^[0-9]+$ ]]; then
+    echo "MAX_CHECKS must be a non-negative integer." >&2
+    exit 2
+fi
+
+check_count=0
 
 # Endlosschleife für die Überwachung
-while true; do
+while [[ "$MAX_CHECKS" -eq 0 || "$check_count" -lt "$MAX_CHECKS" ]]; do
     # Direktes Auslesen der Swap-Werte aus /proc/meminfo ohne externe Tools
     while read -r key value unit; do
         case "$key" in
             SwapTotal:) swap_total=$value ;;
             SwapFree:)  swap_free=$value ;;
         esac
-    done < /proc/meminfo
+    done < "$MEMINFO_FILE"
 
     # Berechnung nur ausführen, wenn Swap konfiguriert ist
     if [[ -n "$swap_total" && "$swap_total" -gt 0 ]]; then
@@ -47,6 +56,11 @@ while true; do
         fi
     fi
 
+    ((check_count += 1))
+
     # Pausieren bis zum nächsten Check
+    if [[ "$MAX_CHECKS" -gt 0 && "$check_count" -ge "$MAX_CHECKS" ]]; then
+        break
+    fi
     sleep "$SLEEP_TIME"
 done

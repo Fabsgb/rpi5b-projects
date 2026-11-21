@@ -21,13 +21,14 @@ from getpass import getuser
 from argparse import ArgumentParser
 
 from dotenv import load_dotenv
-from camoufox.sync_api import Camoufox
 from colorama import init
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import Browser
 
 from fabs_lib_common import log_event
+from fabs_lib_image_gemeration import prepare_image_site
+from fabs_lib_playwright import start_browser
 
-def run(camoufox: Camoufox) -> None:
+def run(camoufox: Browser) -> None:
     global tmp_path
 
     target_url = getenv("gen_url")
@@ -41,76 +42,7 @@ def run(camoufox: Camoufox) -> None:
     page.goto(target_url)
     log_event("Site loaded successfully.", level="SUCCESS")
 
-    preferences_link = page.locator("#changePreferencesLinkEl")
-    log_event("Checking for preferences dialog...", level="INFO")
-    try:
-        preferences_link.wait_for(state="visible", timeout=2_000)
-    except PlaywrightTimeoutError:
-        log_event("Preferences dialog not found; continuing.", level="INFO")
-    else:
-        try:
-            log_event("Opening preferences dialog...", level="INFO")
-            preferences_link.click(timeout=10_000)
-        except PlaywrightTimeoutError:
-            log_event("Button click failed for the preferences dialog; trying JS fallback.", level="WARNING")
-            preferences_link.evaluate("element => element.click()")
-
-        visibility = page.locator("#sensitiveContentVisibilityEl")
-        try:
-            log_event("Setting sensitive-content visibility to warn...", level="INFO")
-            selected_values = visibility.select_option("warn", timeout=10_000)
-        except PlaywrightTimeoutError:
-            log_event("select_option() timed out; using JS fallback.", level="WARNING")
-            selected_value = visibility.evaluate(
-                """element => {
-                    element.value = "warn";
-                    element.dispatchEvent(new Event("input", { bubbles: true }));
-                    element.dispatchEvent(new Event("change", { bubbles: true }));
-                    return element.value;
-                }"""
-            )
-            if selected_value != "warn":
-                raise RuntimeError(
-                    "Could not set sensitive-content visibility to warn."
-                )
-            log_event("Sensitive-content visibility set via JS fallback.", level="SUCCESS")
-        else:
-            if selected_values != ["warn"]:
-                raise RuntimeError(
-                    "Could not set sensitive-content visibility to warn."
-                )
-            log_event("Sensitive-content visibility set to warn.", level="SUCCESS")
-
-        age_verification_label = page.locator(
-            'label[for="ageVerificationCheckboxEl"]'
-        )
-        try:
-            log_event("Checking age verification...", level="INFO")
-            age_verification_label.click(timeout=10_000)
-        except PlaywrightTimeoutError:
-            log_event("Age verification checkbox click failed; checking via form control fallback.", level="WARNING")
-            page.locator("#ageVerificationCheckboxEl").check(timeout=10_000)
-
-        save_preferences = page.locator('button[onclick*="savePreferences"]')
-        try:
-            log_event("Saving preferences...", level="INFO")
-            save_preferences.click(timeout=10_000)
-        except PlaywrightTimeoutError:
-            log_event("Save button click failed; trying JS fallback.", level="WARNING")
-            save_preferences.evaluate("element => element.click()")
-
-    show_content = page.locator("#showContentBtn")
-    log_event("Showing content...", level="INFO")
-    try:
-        show_content.wait_for(state="visible", timeout=2_000)
-    except PlaywrightTimeoutError:
-        log_event("Content button not found; continuing.", level="INFO")
-    else:
-        try:
-            show_content.click(timeout=10_000)
-        except PlaywrightTimeoutError:
-            log_event("showContent button click failed; using JS fallback.", level="WARNING")
-            show_content.evaluate("element => element.click()")
+    prepare_image_site(page)
 
     frame = page.frame_locator("#outputIframeEl")
     style = frame.locator("select[data-name='artStyle']")
@@ -160,7 +92,7 @@ if __name__ == "__main__":
     args = argument_parser.parse_args()
 
     try:
-        with Camoufox(humanize=True, headless=not args.gui, proxy={"server": "http://localhost:666"}) as camoufox:
+        with start_browser(headless=not args.gui) as camoufox:
             run(camoufox)
     except KeyboardInterrupt:
         log_event("Script interrupted by user; Exiting.", level="ERROR")

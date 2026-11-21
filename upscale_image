@@ -23,17 +23,21 @@ from math import isfinite
 from sys import exit as bye, stdin
 from subprocess import run as subprocess_run
 from time import monotonic
-from urllib import request
 from base64 import b64decode, b64encode
 from os import getenv, makedirs, path
 
 from colorama import init
-from camoufox.sync_api import Camoufox
 from dotenv import load_dotenv
+from playwright.sync_api import Browser
 
 from fabs_lib import log, output, tmp_path
 from fabs_lib_common import log_event, timed_input
-from fabs_lib_playwright import get_content_frame
+from fabs_lib_playwright import (
+    get_content_frame,
+    proxy_check,
+    remaining_timeout_ms,
+    start_browser,
+)
 
 
 def parse_proxy(value: str) -> str | bool:
@@ -43,7 +47,7 @@ def parse_proxy(value: str) -> str | bool:
 
 
 def browse(
-    camoufox: Camoufox,
+    camoufox: Browser,
     image: bytes,
     *,
     timeout: float | None,
@@ -52,19 +56,6 @@ def browse(
     raw = None
     deadline = monotonic() + timeout if timeout is not None else None
 
-    def remaining_time() -> float:
-        if deadline is None:
-            raise RuntimeError("No timeout deadline was set.")
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise TimeoutError("The operation exceeded --timeout.")
-        return remaining
-
-    def remaining_timeout_ms() -> int | None:
-        if deadline is None:
-            return None
-        return max(1, int(remaining_time() * 1000))
-
     try:
         log_event("Starting the browser...", level="INFO")
         browser = camoufox
@@ -72,44 +63,24 @@ def browse(
         page = context.new_page()
 
         def refresh_default_timeout() -> None:
-            default_timeout = remaining_timeout_ms()
+            default_timeout = remaining_timeout_ms(deadline)
             if default_timeout is not None:
                 page.set_default_timeout(default_timeout)
 
         #-----IP address check-----#
         if proxy_warning:
             log_event("Checking for IP address errors", level="INFO")
-            ip_timeout = remaining_timeout_ms()
-            page.goto(
-                "http://api.ipify.org",
-                **({"timeout": ip_timeout} if ip_timeout is not None else {}),
-            )
-            refresh_default_timeout()
-            ip_addr = page.locator('pre').inner_text()
-            request_timeout = remaining_time() if deadline is not None else None
-            with request.urlopen(
-                "http://api.ipify.org",
-                **({"timeout": request_timeout} if request_timeout is not None else {}),
-            ) as response:
-                host_ip = response.read().decode("utf-8")
-            if ip_addr == host_ip:
-                log_event(f"IP Address '{ip_addr}' is the ip address of your host and is being used as the ip addres of the browser, something might be wrong with the proxy configuration, please check!", level="WARNING")
-                prompt = "Should the upscaling be continued (y/N)? "
-                if deadline is None:
-                    continue_upscaling = input(prompt).casefold() == "y"
-                else:
-                    continue_upscaling = (
-                        timed_input(prompt, timeout=min(30, remaining_time())) or ""
-                    ).casefold() == "y"
-                if not continue_upscaling:
-                    browser.close()
-                    return False, raw
-                log_event("Continuing generation...", level="INFO")
-            log_event(f"VPN IP Address: {ip_addr}", level="INFO")
+            if not proxy_check(
+                page,
+                deadline=deadline,
+                prompt="Should the upscaling be continued (y/N)? ",
+                warning_level="WARNING",
+            ):
+                return False, raw
 
         #-----Switching sites-----#
         log_event("Navigating to the wanted website", level="INFO")
-        navigation_timeout = remaining_timeout_ms()
+        navigation_timeout = remaining_timeout_ms(deadline)
         page.goto(
             getenv("upscale_url"),
             **({"timeout": navigation_timeout} if navigation_timeout is not None else {}),
@@ -123,7 +94,7 @@ def browse(
         iframe.locator("#file").set_input_files({"name": f"image.jpg", "mimeType": "image/jpeg", "buffer": image})
 
         #-----Download file-----#
-        download_timeout = remaining_timeout_ms()
+        download_timeout = remaining_timeout_ms(deadline)
         if download_timeout is None:
             download_timeout = 60000
         with page.expect_download(timeout=download_timeout) as download_info:
@@ -185,10 +156,9 @@ def run() -> None:
             log_event(f"the image input is neither a path nor a valid base64!", level="ERROR")
             bye(1)
 
-    with Camoufox(
-        humanize=True,
+    with start_browser(
         headless=not args.gui,
-        proxy={"server": args.proxy} if args.proxy else None,
+        proxy=args.proxy,
     ) as browser:
         data = browse(
             camoufox=browser,
